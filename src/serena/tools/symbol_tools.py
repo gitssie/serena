@@ -342,3 +342,31 @@ class RenameSymbolTool(Tool, ToolMarkerSymbolicEdit):
         code_editor = self.create_code_editor()
         status_message = code_editor.rename_symbol(name_path, relative_file_path=relative_path, new_name=new_name)
         return status_message
+
+
+class DiagnosticsTool(Tool, ToolMarkerSymbolicRead):
+    """
+    Requests diagnostics for a given file from the language server.
+    """
+
+    def apply(self, relative_path: str) -> str:
+        """
+        Retrieves diagnostics (errors, warnings, information, hints, etc.) for the given file from the language server.
+        Diagnostics include compilation errors, warnings, linting issues, type errors, and code quality suggestions.
+        The diagnostic 'code' field often contains error codes that can be used to identify specific issues.
+
+        :param relative_path: the relative path to the file to retrieve diagnostics for
+        :return: a JSON object containing the list of diagnostics for the file
+        """
+        symbol_retriever = self.create_language_server_symbol_retriever()
+        diagnostics = symbol_retriever.request_text_document_diagnostics(relative_path, timeout=30)
+        diagnostics_list = [
+            {
+                "severity": diag["severity"],
+                "message": diag["message"],
+                "range": diag["range"]
+            }
+            for diag in diagnostics
+        ]
+        return self._to_json(diagnostics_list)
+

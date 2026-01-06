@@ -9,15 +9,15 @@ import subprocess
 import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Hashable, Iterator
+from collections.abc import Callable, Hashable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy
 from pathlib import Path, PurePath
 from time import sleep
-from typing import Self, Union, cast
+from typing import Self, Union, cast, List
 
 import pathspec
-from sensai.util.pickle import getstate, load_pickle
+from sensai.util.pickle import getstate
 
 from serena.text_utils import MatchedConsecutiveLines
 from serena.util.file_system import match_path
@@ -25,7 +25,7 @@ from solidlsp import ls_types
 from solidlsp.ls_config import Language, LanguageServerConfig
 from solidlsp.ls_exceptions import SolidLSPException
 from solidlsp.ls_handler import SolidLanguageServerHandler
-from solidlsp.ls_types import UnifiedSymbolInformation
+from solidlsp.ls_types import SymbolKind, UnifiedSymbolInformation
 from solidlsp.ls_utils import FileUtils, PathUtils, TextUtils
 from solidlsp.lsp_protocol_handler import lsp_types
 from solidlsp.lsp_protocol_handler import lsp_types as LSPTypes
@@ -45,6 +45,7 @@ from solidlsp.lsp_protocol_handler.server import (
 )
 from solidlsp.settings import SolidLSPSettings
 from solidlsp.util.cache import load_cache, save_cache
+from solidlsp.util.kuzu_symbol_cache import KuzuSymbolCache
 
 GenericDocumentSymbol = Union[LSPTypes.DocumentSymbol, LSPTypes.SymbolInformation, ls_types.UnifiedSymbolInformation]
 log = logging.getLogger(__name__)
@@ -135,7 +136,7 @@ class SolidLanguageServer(ABC):
     The LanguageServer class provides a language agnostic interface to the Language Server Protocol.
     It is used to communicate with Language Servers of different programming languages.
     """
-
+    
     CACHE_FOLDER_NAME = "cache"
     RAW_DOCUMENT_SYMBOLS_CACHE_VERSION = 1
     """
@@ -281,17 +282,15 @@ class SolidLanguageServer(ABC):
             Path(self.repository_root_path) / self._solidlsp_settings.project_data_relative_path / self.CACHE_FOLDER_NAME / self.language_id
         )
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        # * raw document symbols cache
-        self._ls_specific_raw_document_symbols_cache_version = cache_version_raw_document_symbols
-        self._raw_document_symbols_cache: dict[str, tuple[str, list[DocumentSymbol] | list[SymbolInformation] | None]] = {}
-        """maps relative file paths to a tuple of (file_content_hash, raw_root_symbols)"""
-        self._raw_document_symbols_cache_is_modified: bool = False
-        self._load_raw_document_symbols_cache()
-        # * high-level document symbols cache
-        self._document_symbols_cache: dict[str, tuple[str, DocumentSymbols]] = {}
-        """maps relative file paths to a tuple of (file_content_hash, document_symbols)"""
-        self._document_symbols_cache_is_modified: bool = False
-        self._load_document_symbols_cache()
+        
+        # Initialize Kùzu-based symbol cache (required)
+        try:
+            self.kuzu_cache = KuzuSymbolCache(str(self.cache_dir / "kuzu"))
+            log.info(f"Using Kùzu graph database for symbol caching for {language_id}")
+        except ImportError as e:
+            raise ValueError(
+                "Kùzu is required for symbol caching. Install it with: pip install kuzu"
+            ) from e
 
         self.server_started = False
         self.completions_available = threading.Event()
@@ -393,6 +392,20 @@ class SolidLanguageServer(ABC):
 
         return match_path(relative_path, self.get_ignore_spec(), root_path=self.repository_root_path)
 
+    def _validate_file_path(self, relative_file_path: str) -> None:
+        """
+        Validate that the given relative path points to an existing file.
+
+        :param relative_file_path: The relative path to validate
+        :raises FileNotFoundError: If the file does not exist
+        :raises ValueError: If the path is not a file (e.g., it's a directory)
+        """
+        abs_path = (Path(self.repository_root_path) / relative_file_path).resolve()
+        if not abs_path.exists():
+            raise FileNotFoundError(f"File not found: {relative_file_path}")
+        if not abs_path.is_file():
+            raise ValueError(f"Path is not a file: {relative_file_path}")
+
     def _shutdown(self, timeout: float = 5.0) -> None:
         """
         A robust shutdown process designed to terminate cleanly on all platforms, including Windows,
@@ -453,8 +466,8 @@ class SolidLanguageServer(ABC):
             log.error(f"Error during process shutdown: {e}")
 
     @contextmanager
-    def start_server(self) -> Iterator["SolidLanguageServer"]:
-        self.start()
+    def start_server(self, rebuild_indexes: bool=False) -> Iterator["SolidLanguageServer"]:
+        self.start(rebuild_indexes=rebuild_indexes)
         yield self
         self.stop()
 
@@ -533,7 +546,7 @@ class SolidLanguageServer(ABC):
         :param relative_file_path: the relative path of the file to open.
         :param file_buffer: an optional existing file buffer to reuse.
         """
-        if file_buffer is not None:
+        if file_buffer is not None and file_buffer.ref_count >= 1:
             yield file_buffer
         else:
             with self.open_file(relative_file_path) as fb:
@@ -708,7 +721,7 @@ class SolidLanguageServer(ABC):
             }
         )
 
-    def request_references(self, relative_file_path: str, line: int, column: int) -> list[ls_types.Location]:
+    def request_references(self, relative_file_path: str, line: int, column: int, max_matches: int = 50) -> list[ls_types.Location]:
         """
         Raise a [textDocument/references](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_references) request to the Language Server
         to find references to the symbol at the given line and column in the given file. Wait for the response and return the result.
@@ -717,6 +730,7 @@ class SolidLanguageServer(ABC):
         :param relative_file_path: The relative path of the file that has the symbol for which references should be looked up
         :param line: The line number of the symbol
         :param column: The column number of the symbol
+        :param max_matches: Maximum number of references to return. Default is 50.
 
         :return: A list of locations where the symbol is referenced (excluding ignored directories)
         """
@@ -769,10 +783,15 @@ class SolidLanguageServer(ABC):
             new_item["absolutePath"] = str(abs_path)
             new_item["relativePath"] = str(rel_path)
             ret.append(ls_types.Location(**new_item))  # type: ignore
+            
+            # Check if we've reached the max_matches limit
+            if len(ret) >= max_matches:
+                log.info(f"Reached max_matches limit of {max_matches}, stopping collection")
+                break
 
         return ret
 
-    def request_text_document_diagnostics(self, relative_file_path: str) -> list[ls_types.Diagnostic]:
+    def request_text_document_diagnostics(self, relative_file_path: str, timeout: float = 15.0) -> list[ls_types.Diagnostic]:
         """
         Raise a [textDocument/diagnostic](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_diagnostic) request to the Language Server
         to find diagnostics for the given file. Wait for the response and return the result.
@@ -784,6 +803,8 @@ class SolidLanguageServer(ABC):
         if not self.server_started:
             log.error("request_text_document_diagnostics called before Language Server started")
             raise SolidLSPException("Language Server not started")
+
+        self._validate_file_path(relative_file_path)
 
         with self.open_file(relative_file_path):
             response = self.server.send.text_document_diagnostic(
@@ -842,6 +863,139 @@ class SolidLanguageServer(ABC):
             context_lines_after=context_lines_after,
             source_file_path=relative_file_path,
         )
+
+    def _convert_to_unified_symbol(
+        self, 
+        original_symbol_dict: GenericDocumentSymbol, 
+        relative_file_path: str,
+        file_lines: list[str] | None = None
+    ) -> ls_types.UnifiedSymbolInformation:
+        """
+        Converts the given symbol dictionary to the unified representation, ensuring
+        that all required fields are present (except 'children' which is handled separately).
+
+        :param original_symbol_dict: the item to augment
+        :param relative_file_path: the relative path of the file containing the symbol
+        :param file_lines: optional pre-split file lines for body retrieval
+        :return: the augmented item (new object)
+        """
+        # noinspection PyInvalidCast
+        item = cast(ls_types.UnifiedSymbolInformation, dict(original_symbol_dict))
+        absolute_path = os.path.join(self.repository_root_path, relative_file_path)
+
+        # handle missing location and path entries
+        if "location" not in item:
+            uri = pathlib.Path(absolute_path).as_uri()
+            assert "range" in item
+            tree_location = ls_types.Location(
+                uri=uri,
+                range=item["range"],
+                absolutePath=absolute_path,
+                relativePath=relative_file_path,
+            )
+            item["location"] = tree_location
+        location = item["location"]
+        if "absolutePath" not in location:
+            location["absolutePath"] = absolute_path  # type: ignore
+        if "relativePath" not in location:
+            location["relativePath"] = relative_file_path  # type: ignore
+
+        if "body" not in item:
+            item["body"] = self.retrieve_symbol_body(item, file_lines=file_lines)
+
+        # handle missing selectionRange
+        if "selectionRange" not in item:
+            if "range" in item:
+                item["selectionRange"] = item["range"]
+            else:
+                item["selectionRange"] = item["location"]["range"]
+
+        return item
+
+    def _convert_symbols_with_common_parent(
+        self,
+        symbols: list[DocumentSymbol] | list[SymbolInformation] | list[UnifiedSymbolInformation],
+        parent: ls_types.UnifiedSymbolInformation | None,
+        relative_file_path: str,
+        file_lines: list[str] | None = None
+    ) -> list[ls_types.UnifiedSymbolInformation]:
+        """
+        Converts the given symbols into UnifiedSymbolInformation with proper parent-child relationships,
+        adding overload indices for symbols with the same name under the same parent.
+        
+        :param symbols: the symbols to convert
+        :param parent: the parent symbol (None for root symbols)
+        :param relative_file_path: the relative path of the file containing the symbols
+        :param file_lines: optional pre-split file lines for body retrieval
+        :return: list of converted unified symbols
+        """
+        total_name_counts: dict[str, int] = defaultdict(lambda: 0)
+        for symbol in symbols:
+            total_name_counts[symbol["name"]] += 1
+        name_counts: dict[str, int] = defaultdict(lambda: 0)
+        unified_symbols = []
+        for symbol in symbols:
+            usymbol = self._convert_to_unified_symbol(symbol, relative_file_path, file_lines)
+            if total_name_counts[usymbol["name"]] > 1:
+                usymbol["overload_idx"] = name_counts[usymbol["name"]]
+            name_counts[usymbol["name"]] += 1
+            usymbol["parent"] = parent
+            if "children" in usymbol:
+                usymbol["children"] = self._convert_symbols_with_common_parent(usymbol["children"], usymbol, relative_file_path, file_lines)  # type: ignore
+            else:
+                usymbol["children"] = []  # type: ignore
+            unified_symbols.append(usymbol)
+        return unified_symbols
+
+    def _convert_symbol_tree_to_unified(
+        self,
+        symbol_dict: dict,
+        relative_file_path: str,
+        parent: ls_types.UnifiedSymbolInformation | None
+    ) -> ls_types.UnifiedSymbolInformation:
+        """
+        Recursively convert a symbol tree (with children already populated) to UnifiedSymbolInformation.
+        This is used for symbols retrieved from Kùzu that already have their full tree structure.
+        
+        :param symbol_dict: the symbol dictionary with children already populated
+        :param relative_file_path: the relative path of the file containing the symbol
+        :param parent: the parent symbol (None for root symbols)
+        :return: converted unified symbol with children
+        """
+        # Convert the symbol itself
+        unified_sym = self._convert_to_unified_symbol(symbol_dict, relative_file_path, file_lines=None)
+        unified_sym["parent"] = parent
+        
+        # Recursively convert children
+        if "children" in symbol_dict and symbol_dict["children"]:
+            unified_children = []
+            for child_dict in symbol_dict["children"]:
+                unified_child = self._convert_symbol_tree_to_unified(child_dict, relative_file_path, unified_sym)
+                unified_children.append(unified_child)
+            unified_sym["children"] = unified_children  # type: ignore
+        else:
+            unified_sym["children"] = []  # type: ignore
+        
+        return unified_sym
+    
+    def _convert_file_symbol_children_to_unified(
+        self,
+        file_symbols: List[dict]
+    ) -> List[ls_types.UnifiedSymbolInformation]:
+        """
+        Convert File symbols and their children to UnifiedSymbolInformation list.
+        
+        :param file_symbols: List of File symbol dictionaries with structure:
+                            {'name': 'file.java', 'kind': 1, 'relativePath': 'path', 'children': [...]}
+        :return: Flat list of all UnifiedSymbolInformation (children of all files)
+        """
+        all_unified_symbols = []
+        for file_sym_dict in file_symbols:
+            rel_path = file_sym_dict.get('relativePath')
+            for child_dict in file_sym_dict.get('children', []):
+                unified_child = self._convert_symbol_tree_to_unified(child_dict, rel_path, parent=file_sym_dict)
+                all_unified_symbols.append(unified_child)
+        return all_unified_symbols
 
     def request_completions(
         self, relative_file_path: str, line: int, column: int, allow_incomplete: bool = False
@@ -941,35 +1095,12 @@ class SolidLanguageServer(ABC):
         :return: the list of root symbols in the file.
         """
 
-        def get_cached_raw_document_symbols(cache_key: str, fd: LSPFileBuffer) -> list[SymbolInformation] | list[DocumentSymbol] | None:
-            file_hash_and_result = self._raw_document_symbols_cache.get(cache_key)
-            if file_hash_and_result is not None:
-                file_hash, result = file_hash_and_result
-                if file_hash == fd.content_hash:
-                    log.debug("Returning cached raw document symbols for %s", relative_file_path)
-                    return result
-                else:
-                    log.debug("Document content for %s has changed (raw symbol cache is not up-to-date)", relative_file_path)
-            else:
-                log.debug("No cache hit for raw document symbols symbols in %s", relative_file_path)
-            return None
-
         def get_raw_document_symbols(fd: LSPFileBuffer) -> list[SymbolInformation] | list[DocumentSymbol] | None:
-            # check for cached result
-            cache_key = relative_file_path
-            response = get_cached_raw_document_symbols(cache_key, fd)
-            if response is not None:
-                return response
-
             # no cached result, query language server
             log.debug(f"Requesting document symbols for {relative_file_path} from the Language Server")
             response = self.server.send.document_symbol(
                 {"textDocument": {"uri": pathlib.Path(os.path.join(self.repository_root_path, relative_file_path)).as_uri()}}
             )
-
-            # update cache
-            self._raw_document_symbols_cache[cache_key] = (fd.content_hash, response)
-            self._raw_document_symbols_cache_is_modified = True
 
             return response
 
@@ -979,7 +1110,7 @@ class SolidLanguageServer(ABC):
             with self.open_file(relative_file_path) as opened_file_data:
                 return get_raw_document_symbols(opened_file_data)
 
-    def request_document_symbols(self, relative_file_path: str, file_buffer: LSPFileBuffer | None = None) -> DocumentSymbols:
+    def request_document_symbols(self, relative_file_path: str, file_buffer: LSPFileBuffer | None = None,ignore_cache: bool = False) -> DocumentSymbols:
         """
         Retrieves the collection of symbols in the given file
 
@@ -992,20 +1123,19 @@ class SolidLanguageServer(ABC):
             where the parent attribute will be the file symbol which in turn may have a package symbol as parent.
             If you need a symbol tree that contains file symbols as well, you should use `request_full_symbol_tree` instead.
         """
+        if not ignore_cache:
+            if file_buffer is None:
+                file_buffer = self.read_file(relative_file_path)
+            
+            # Try Kùzu cache
+            cached = self.kuzu_cache.get_doc_symbols(relative_file_path, file_buffer.content_hash)
+            if cached is not None:
+                log.debug("Returning cached document symbols for %s from Kùzu", relative_file_path)
+                file_symbol = cached['file_symbol']
+                all_unified_symbols = self._convert_file_symbol_children_to_unified([file_symbol])
+                return DocumentSymbols(all_unified_symbols)
+        
         with self._open_file_context(relative_file_path, file_buffer) as file_data:
-            # check if the desired result is cached
-            cache_key = relative_file_path
-            file_hash_and_result = self._document_symbols_cache.get(cache_key)
-            if file_hash_and_result is not None:
-                file_hash, document_symbols = file_hash_and_result
-                if file_hash == file_data.content_hash:
-                    log.debug("Returning cached document symbols for %s", relative_file_path)
-                    return document_symbols
-                else:
-                    log.debug("Cached document symbol content for %s has changed", relative_file_path)
-            else:
-                log.debug("No cache hit for document symbols in %s", relative_file_path)
-
             # no cached result: request the root symbols from the language server
             root_symbols = self._request_document_symbols(relative_file_path, file_data)
 
@@ -1022,84 +1152,28 @@ class SolidLanguageServer(ABC):
 
             file_lines = file_data.split_lines()
 
-            def convert_to_unified_symbol(original_symbol_dict: GenericDocumentSymbol) -> ls_types.UnifiedSymbolInformation:
-                """
-                Converts the given symbol dictionary to the unified representation, ensuring
-                that all required fields are present (except 'children' which is handled separately).
-
-                :param original_symbol_dict: the item to augment
-                :return: the augmented item (new object)
-                """
-                # noinspection PyInvalidCast
-                item = cast(ls_types.UnifiedSymbolInformation, dict(original_symbol_dict))
-                absolute_path = os.path.join(self.repository_root_path, relative_file_path)
-
-                # handle missing location and path entries
-                if "location" not in item:
-                    uri = pathlib.Path(absolute_path).as_uri()
-                    assert "range" in item
-                    tree_location = ls_types.Location(
-                        uri=uri,
-                        range=item["range"],
-                        absolutePath=absolute_path,
-                        relativePath=relative_file_path,
-                    )
-                    item["location"] = tree_location
-                location = item["location"]
-                if "absolutePath" not in location:
-                    location["absolutePath"] = absolute_path  # type: ignore
-                if "relativePath" not in location:
-                    location["relativePath"] = relative_file_path  # type: ignore
-
-                if "body" not in item:
-                    item["body"] = self.retrieve_symbol_body(item, file_lines=file_lines)
-
-                # handle missing selectionRange
-                if "selectionRange" not in item:
-                    if "range" in item:
-                        item["selectionRange"] = item["range"]
-                    else:
-                        item["selectionRange"] = item["location"]["range"]
-
-                return item
-
-            def convert_symbols_with_common_parent(
-                symbols: list[DocumentSymbol] | list[SymbolInformation] | list[UnifiedSymbolInformation],
-                parent: ls_types.UnifiedSymbolInformation | None,
-            ) -> list[ls_types.UnifiedSymbolInformation]:
-                """
-                Converts the given symbols into UnifiedSymbolInformation with proper parent-child relationships,
-                adding overload indices for symbols with the same name under the same parent.
-                """
-                total_name_counts: dict[str, int] = defaultdict(lambda: 0)
-                for symbol in symbols:
-                    total_name_counts[symbol["name"]] += 1
-                name_counts: dict[str, int] = defaultdict(lambda: 0)
-                unified_symbols = []
-                for symbol in symbols:
-                    usymbol = convert_to_unified_symbol(symbol)
-                    if total_name_counts[usymbol["name"]] > 1:
-                        usymbol["overload_idx"] = name_counts[usymbol["name"]]
-                    name_counts[usymbol["name"]] += 1
-                    usymbol["parent"] = parent
-                    if "children" in usymbol:
-                        usymbol["children"] = convert_symbols_with_common_parent(usymbol["children"], usymbol)  # type: ignore
-                    else:
-                        usymbol["children"] = []  # type: ignore
-                    unified_symbols.append(usymbol)
-                return unified_symbols
-
-            unified_root_symbols = convert_symbols_with_common_parent(root_symbols, None)
+            unified_root_symbols = self._convert_symbols_with_common_parent(root_symbols, None, relative_file_path, file_lines)
             document_symbols = DocumentSymbols(unified_root_symbols)
 
-            # update cache
+            # Store in Kùzu cache
             log.debug("Updating cached document symbols for %s", relative_file_path)
-            self._document_symbols_cache[cache_key] = (file_data.content_hash, document_symbols)
-            self._document_symbols_cache_is_modified = True
+            try:
+                self.kuzu_cache.store_doc_symbols(
+                    relative_file_path,
+                    file_data.content_hash,
+                    unified_root_symbols
+                )
+            except Exception as e:
+                log.error(f"Failed to store symbols in Kùzu cache for {relative_file_path}: {e}")
 
             return document_symbols
 
-    def request_full_symbol_tree(self, within_relative_path: str | None = None) -> list[ls_types.UnifiedSymbolInformation]:
+    def request_full_symbol_tree(
+        self, 
+        within_relative_path: str | None = None,
+        symbol_filter: Callable[[ls_types.UnifiedSymbolInformation], bool] | None = None,
+        file_filter: Callable[[str], bool] | None = None
+    ) -> list[ls_types.UnifiedSymbolInformation]:
         """
         Will go through all files in the project or within a relative path and build a tree of symbols.
         Note: this may be slow the first time it is called, especially if `within_relative_path` is not used to restrict the search.
@@ -1110,10 +1184,19 @@ class SolidLanguageServer(ABC):
         All symbols except the root packages will have a parent attribute.
         Will ignore directories starting with '.', language-specific defaults
         and user-configured directories (e.g. from .gitignore).
+        
+        PERFORMANCE NOTE: This method now attempts to use Kùzu cache when possible to avoid
+        redundant file parsing. Symbol and file filters are still applied for precise results.
 
         :param within_relative_path: pass a relative path to only consider symbols within this path.
             If a file is passed, only the symbols within this file will be considered.
             If a directory is passed, all files within this directory will be considered.
+        :param symbol_filter: an optional callable to filter symbols. If provided, only symbols (and their descendants)
+            for which the filter returns True will be included. This filtering happens early, avoiding unnecessary
+            file symbol creation and improving performance.
+        :param file_filter: an optional callable to determine whether a file should be processed at all.
+            Receives the relative file path. If it returns False, the file is skipped entirely (no document symbols requested).
+            This is more efficient than symbol_filter for filtering at the file level.
         :return: A list of root symbols representing the top-level packages/modules in the project.
         """
         if within_relative_path is not None:
@@ -1180,15 +1263,37 @@ class SolidLanguageServer(ABC):
                     continue
 
                 if os.path.isdir(contained_dir_or_file_abs_path):
+                    # Apply file filter to directories to skip entire subdirectories
+                    if file_filter is not None and not file_filter(contained_dir_or_file_rel_path):
+                        log.debug("Skipping directory: %s (filtered by file_filter)", contained_dir_or_file_rel_path)
+                        continue
+                    
                     child_symbols = process_directory(contained_dir_or_file_rel_path)
                     package_symbol["children"].extend(child_symbols)
                     for child in child_symbols:
                         child["parent"] = package_symbol
 
                 elif os.path.isfile(contained_dir_or_file_abs_path):
+                    # Apply file filter early to skip processing entirely
+                    if file_filter is not None and not file_filter(contained_dir_or_file_rel_path):
+                        log.debug("Skipping file: %s (filtered by file_filter)", contained_dir_or_file_rel_path)
+                        continue
+                    
                     with self._open_file_context(contained_dir_or_file_rel_path) as file_data:
                         document_symbols = self.request_document_symbols(contained_dir_or_file_rel_path, file_data)
                         file_root_nodes = document_symbols.root_symbols
+
+                        # Apply symbol filter early to avoid creating unnecessary file_symbol
+                        if symbol_filter is not None:
+                            filtered_nodes = []
+                            for node in file_root_nodes:
+                                if symbol_filter(node):
+                                    filtered_nodes.append(node)
+                            file_root_nodes = filtered_nodes
+                            
+                            # Skip creating file symbol if all children were filtered out
+                            if not file_root_nodes:
+                                continue
 
                         # Create file symbol, link with children
                         file_range = self._get_range_from_file_content(file_data.contents)
@@ -1246,49 +1351,37 @@ class SolidLanguageServer(ABC):
 
     def request_dir_overview(self, relative_dir_path: str) -> dict[str, list[UnifiedSymbolInformation]]:
         """
+        Get an overview of all symbols in a directory using Kùzu cache query.
+        
+        :param relative_dir_path: The relative path to the directory
         :return: A mapping of all relative paths analyzed to lists of top-level symbols in the corresponding file.
         """
-        symbol_tree = self.request_full_symbol_tree(relative_dir_path)
+        # Use Kùzu cache to query all symbols in the directory
+        # Use empty pattern to match all symbols
+        file_symbols = self.kuzu_cache.query_symbols(
+            name_path_pattern="",
+            substring_matching=False,
+            include_kinds=None,
+            exclude_kinds=None,
+            within_relative_path=relative_dir_path
+        )
+        
+        # Filter and update file symbols based on file existence and content hash
+        filtered_file_symbols = self._filter_and_update_file_symbols(file_symbols)
+        
         # Initialize result dictionary
         result: dict[str, list[UnifiedSymbolInformation]] = defaultdict(list)
-
-        # Helper function to process a symbol and its children
-        def process_symbol(symbol: ls_types.UnifiedSymbolInformation) -> None:
-            if symbol["kind"] == ls_types.SymbolKind.File:
-                # For file symbols, process their children (top-level symbols)
-                for child in symbol["children"]:
-                    # Handle cross-platform path resolution (fixes Docker/macOS path issues)
-                    absolute_path = Path(child["location"]["absolutePath"]).resolve()
-                    repository_root = Path(self.repository_root_path).resolve()
-
-                    # Try pathlib first, fallback to alternative approach if paths are incompatible
-                    try:
-                        path = absolute_path.relative_to(repository_root)
-                    except ValueError:
-                        # If paths are from different roots (e.g., /workspaces vs /Users),
-                        # use the relativePath from location if available, or extract from absolutePath
-                        if "relativePath" in child["location"] and child["location"]["relativePath"]:
-                            path = Path(child["location"]["relativePath"])
-                        else:
-                            # Extract relative path by finding common structure
-                            # Example: /workspaces/.../test_repo/file.py -> test_repo/file.py
-                            path_parts = absolute_path.parts
-
-                            # Find the last common part or use a fallback
-                            if "test_repo" in path_parts:
-                                test_repo_idx = path_parts.index("test_repo")
-                                path = Path(*path_parts[test_repo_idx:])
-                            else:
-                                # Last resort: use filename only
-                                path = Path(absolute_path.name)
-                    result[str(path)].append(child)
-            # For package/directory symbols, process their children
-            for child in symbol["children"]:
-                process_symbol(child)
-
-        # Process each root symbol
-        for root in symbol_tree:
-            process_symbol(root)
+        
+        # Process each file symbol
+        for file_symbol in filtered_file_symbols:
+            kind = file_symbol.get('kind')
+            if kind != SymbolKind.File.value:
+                continue  # Skip non-file symbols
+            relative_path = file_symbol.get('relativePath', '')
+            # Get top-level symbols (direct children of file symbol)
+            for child in file_symbol.get('children', []):
+                result[relative_path].append(child)
+        
         return result
 
     def request_document_overview(self, relative_file_path: str) -> list[UnifiedSymbolInformation]:
@@ -1296,6 +1389,123 @@ class SolidLanguageServer(ABC):
         :return: the top-level symbols in the given file.
         """
         return self.request_document_symbols(relative_file_path).root_symbols
+    
+    def _filter_and_update_file_symbols(
+        self, file_symbols: list[dict]
+    ) -> list[dict]:
+        """
+        Filter file symbols based on file existence and content hash.
+        Updates symbols for modified files using request_document_symbols.
+        
+        :param file_symbols: List of file symbol dictionaries from kuzu cache
+        :return: Filtered and updated list of file symbols
+        """
+        filtered_symbols = []
+        
+        for file_symbol in file_symbols:
+            relative_path = file_symbol.get('relativePath')
+            cached_content_hash = file_symbol.get('contentHash', '')
+            
+            if not relative_path:
+                log.warning("File symbol missing relativePath, skipping")
+                continue
+            
+            # Check if file exists
+            absolute_path = os.path.join(self.repository_root_path, relative_path)
+            if not os.path.exists(absolute_path):
+                log.debug(f"File no longer exists, filtering out: {relative_path}")
+                continue
+            
+            # Check content hash
+            try:
+                file_buffer = self.read_file(relative_path)
+                current_hash = file_buffer.content_hash
+                
+                # If hash doesn't match, file has been modified
+                if cached_content_hash and current_hash != cached_content_hash:
+                    log.debug(f"File modified (hash mismatch), updating symbols: {relative_path}")
+                    # Get fresh document symbols
+                    doc_symbols = self.request_document_symbols(relative_path, file_buffer, True)
+                    
+                    # Update file symbol with fresh data
+                    file_symbol['contentHash'] = current_hash
+                    file_symbol['children'] = doc_symbols.root_symbols
+                
+                # Add to filtered results
+                filtered_symbols.append(file_symbol)
+            except Exception as e:
+                log.error(f"Error processing file {relative_path}: {e}")
+                continue
+        
+        return filtered_symbols
+    
+    def search_symbols(
+        self,
+        name_path_pattern: str,
+        substring_matching: bool = False,
+        include_kinds: Sequence[SymbolKind] | None = None,
+        exclude_kinds: Sequence[SymbolKind] | None = None,
+        within_relative_path: str | None = None
+    ) -> list[UnifiedSymbolInformation]:
+        """
+        Query symbols matching a name path pattern, optionally limited to a specific file or directory.
+        
+        This method handles the file vs directory distinction:
+        - If within_relative_path is a file, directly queries that file's symbols
+        - If within_relative_path is a directory or None, uses Kùzu graph query for efficient lookup
+        
+        :param name_path_pattern: Pattern to match symbol paths (e.g., "MyClass/my_method")
+        :param substring_matching: Whether to use substring matching for the last segment
+        :param include_kinds: List of symbol kinds to include
+        :param exclude_kinds: List of symbol kinds to exclude
+        :param within_relative_path: Limit search to specific file or directory
+        :return: List of matching symbols with UnifiedSymbolInformation structure
+        """
+
+        # Handle file path separately (single file)
+        if within_relative_path is not None:
+            within_abs_path = os.path.join(self.repository_root_path, within_relative_path)
+            if not os.path.exists(within_abs_path):
+                raise FileNotFoundError(f"File or directory not found: {within_abs_path}")
+            
+            if os.path.isfile(within_abs_path):
+                if self.is_ignored_path(within_relative_path):
+                    log.error("You passed a file explicitly, but it is ignored. File: %s", within_relative_path)
+                    return []
+                else:
+                    # For single file, get all symbols and use request_document_symbols
+                    root_nodes = self.request_document_symbols(within_relative_path).root_symbols
+                    return root_nodes
+        
+        # For directories or no path specified, use Kùzu query if available
+        log.debug(f"Using Kùzu query for pattern '{name_path_pattern}'")
+
+        # Convert SymbolKind to int for internal use
+        include_kinds_int = [k.value if isinstance(k, SymbolKind) else k for k in include_kinds] if include_kinds else None
+        exclude_kinds_int = [k.value if isinstance(k, SymbolKind) else k for k in exclude_kinds] if exclude_kinds else None
+
+        file_symbols = self.kuzu_cache.query_symbols(
+            name_path_pattern=name_path_pattern,
+            substring_matching=substring_matching,
+            include_kinds=include_kinds_int,
+            exclude_kinds=exclude_kinds_int,
+            within_relative_path=within_relative_path
+        )
+        
+        log.debug(f"query_symbols returned {len(file_symbols)} file symbols for pattern '{name_path_pattern}'")
+        
+        # Filter and update file symbols based on file existence and content hash
+        filtered_file_symbols = self._filter_and_update_file_symbols(file_symbols)
+        
+        log.debug(f"After filtering, {len(filtered_file_symbols)} file symbols remain")
+        
+        # Convert File symbols and their children to UnifiedSymbolInformation
+        # Each file_symbol has structure: {'name': 'file.java', 'kind': 1, 'relativePath': 'path', 'children': [...]}
+        all_unified_symbols = self._convert_file_symbol_children_to_unified(filtered_file_symbols)
+        
+        log.debug(f"Converted to {len(all_unified_symbols)} UnifiedSymbolInformation symbols")
+        
+        return all_unified_symbols
 
     def request_overview(self, within_relative_path: str) -> dict[str, list[UnifiedSymbolInformation]]:
         """
@@ -1361,7 +1571,7 @@ class SolidLanguageServer(ABC):
         symbol_end_line = symbol["location"]["range"]["end"]["line"]
         assert "relativePath" in symbol["location"]
         if file_lines is None:
-            with self._open_file_context(symbol["location"]["relativePath"], file_buffer) as f:  # type: ignore
+            with self.read_file(symbol["location"]["relativePath"], file_buffer) as f:  # type: ignore
                 file_lines = f.split_lines()
         symbol_body = "\n".join(file_lines[symbol_start_line : symbol_end_line + 1])
 
@@ -1544,15 +1754,14 @@ class SolidLanguageServer(ABC):
         :return: The container symbol (if found) or None.
         """
         # checking if the line is empty, unfortunately ugly and duplicating code, but I don't want to refactor
-        with self.open_file(relative_file_path):
-            absolute_file_path = str(PurePath(self.repository_root_path, relative_file_path))
-            content = FileUtils.read_file(absolute_file_path, self._encoding)
+        with self.open_file(relative_file_path) as file_data:
+            content = file_data.contents
             if content.split("\n")[line].strip() == "":
                 log.error(f"Passing empty lines to request_container_symbol is currently not supported, {relative_file_path=}, {line=}")
                 return None
 
         document_symbols = self.request_document_symbols(relative_file_path)
-
+        absolute_file_path = str(PurePath(self.repository_root_path, relative_file_path))
         # make jedi and pyright api compatible
         # the former has no location, the later has no range
         # we will just always add location of the desired format to all symbols
@@ -1699,110 +1908,9 @@ class SolidLanguageServer(ABC):
 
         return defining_symbol
 
-    def _save_raw_document_symbols_cache(self) -> None:
-        cache_file = self.cache_dir / self.RAW_DOCUMENT_SYMBOL_CACHE_FILENAME
-
-        if not self._raw_document_symbols_cache_is_modified:
-            log.debug("No changes to raw document symbols cache, skipping save")
-            return
-
-        log.info("Saving updated raw document symbols cache to %s", cache_file)
-        try:
-            save_cache(str(cache_file), self._raw_document_symbols_cache_version(), self._raw_document_symbols_cache)
-            self._raw_document_symbols_cache_is_modified = False
-        except Exception as e:
-            log.error(
-                "Failed to save raw document symbols cache to %s: %s. Note: this may have resulted in a corrupted cache file.",
-                cache_file,
-                e,
-            )
-
-    def _raw_document_symbols_cache_version(self) -> tuple[int, Hashable]:
-        return (self.RAW_DOCUMENT_SYMBOLS_CACHE_VERSION, self._ls_specific_raw_document_symbols_cache_version)
-
-    def _load_raw_document_symbols_cache(self) -> None:
-        cache_file = self.cache_dir / self.RAW_DOCUMENT_SYMBOL_CACHE_FILENAME
-
-        if not cache_file.exists():
-            # check for legacy cache to load to migrate
-            legacy_cache_file = self.cache_dir / self.RAW_DOCUMENT_SYMBOL_CACHE_FILENAME_LEGACY_FALLBACK
-            if legacy_cache_file.exists():
-                try:
-                    legacy_cache: dict[
-                        str, tuple[str, tuple[list[ls_types.UnifiedSymbolInformation], list[ls_types.UnifiedSymbolInformation]]]
-                    ] = load_pickle(legacy_cache_file)
-                    log.info("Migrating legacy document symbols cache with %d entries", len(legacy_cache))
-                    num_symbols_migrated = 0
-                    migrated_cache = {}
-                    for cache_key, (file_hash, (all_symbols, root_symbols)) in legacy_cache.items():
-                        if cache_key.endswith("-True"):  # include_body=True
-                            new_cache_key = cache_key[:-5]
-                            migrated_cache[new_cache_key] = (file_hash, root_symbols)
-                            num_symbols_migrated += len(all_symbols)
-                    log.info("Migrated %d document symbols from legacy cache", num_symbols_migrated)
-                    self._raw_document_symbols_cache = migrated_cache  # type: ignore
-                    self._raw_document_symbols_cache_is_modified = True
-                    self._save_raw_document_symbols_cache()
-                    legacy_cache_file.unlink()
-                    return
-                except Exception as e:
-                    log.error("Error during cache migration: %s", e)
-                    return
-
-        # load existing cache (if any)
-        if cache_file.exists():
-            log.info("Loading document symbols cache from %s", cache_file)
-            try:
-                saved_cache = load_cache(str(cache_file), self._raw_document_symbols_cache_version())
-                if saved_cache is not None:
-                    self._raw_document_symbols_cache = saved_cache
-                    log.info(f"Loaded {len(self._raw_document_symbols_cache)} entries from raw document symbols cache.")
-            except Exception as e:
-                # cache can become corrupt, so just skip loading it
-                log.warning(
-                    "Failed to load raw document symbols cache from %s (%s); Ignoring cache.",
-                    cache_file,
-                    e,
-                )
-
-    def _save_document_symbols_cache(self) -> None:
-        cache_file = self.cache_dir / self.DOCUMENT_SYMBOL_CACHE_FILENAME
-
-        if not self._document_symbols_cache_is_modified:
-            log.debug("No changes to document symbols cache, skipping save")
-            return
-
-        log.info("Saving updated document symbols cache to %s", cache_file)
-        try:
-            save_cache(str(cache_file), self.DOCUMENT_SYMBOL_CACHE_VERSION, self._document_symbols_cache)
-            self._document_symbols_cache_is_modified = False
-        except Exception as e:
-            log.error(
-                "Failed to save document symbols cache to %s: %s. Note: this may have resulted in a corrupted cache file.",
-                cache_file,
-                e,
-            )
-
-    def _load_document_symbols_cache(self) -> None:
-        cache_file = self.cache_dir / self.DOCUMENT_SYMBOL_CACHE_FILENAME
-        if cache_file.exists():
-            log.info("Loading document symbols cache from %s", cache_file)
-            try:
-                saved_cache = load_cache(str(cache_file), self.DOCUMENT_SYMBOL_CACHE_VERSION)
-                if saved_cache is not None:
-                    self._document_symbols_cache = saved_cache
-                    log.info(f"Loaded {len(self._document_symbols_cache)} entries from document symbols cache.")
-            except Exception as e:
-                # cache can become corrupt, so just skip loading it
-                log.warning(
-                    "Failed to load document symbols cache from %s (%s); Ignoring cache.",
-                    cache_file,
-                    e,
-                )
-
     def save_cache(self) -> None:
-        self._save_raw_document_symbols_cache()
-        self._save_document_symbols_cache()
+        # Kùzu cache is automatically persisted, no need for explicit save
+        log.debug("Kùzu cache is automatically managed, no explicit save needed")
 
     def request_workspace_symbol(self, query: str) -> list[ls_types.UnifiedSymbolInformation] | None:
         """
@@ -1877,7 +1985,7 @@ class SolidLanguageServer(ABC):
                 self.delete_text_between_positions(relative_path, start_pos, end_pos)
                 self.insert_text_at_position(relative_path, start_pos["line"], start_pos["character"], edit["newText"])
 
-    def start(self) -> "SolidLanguageServer":
+    def start(self, rebuild_indexes: bool=False) -> "SolidLanguageServer":
         """
         Starts the language server process and connects to it. Call shutdown when ready.
 
@@ -1885,6 +1993,7 @@ class SolidLanguageServer(ABC):
         """
         log.info(f"Starting language server with language {self.language_server.language} for {self.language_server.repository_root_path}")
         self._start_server_process()
+        self.build_index(rebuild_indexes=rebuild_indexes)
         return self
 
     def stop(self, shutdown_timeout: float = 2.0) -> None:
@@ -1914,3 +2023,125 @@ class SolidLanguageServer(ABC):
 
     def is_running(self) -> bool:
         return self.server.is_running()
+
+    def read_file(self, relative_path: str) -> LSPFileBuffer:
+        """
+        Read the contents of a file at the given relative path.
+        :param relative_path: The relative path of the file to read
+        :return: An LSPFileBuffer containing the file contents
+        """
+        absolute_path = str(PurePath(self.repository_root_path, relative_path))
+        uri = pathlib.Path(absolute_path).as_uri()
+        contents = FileUtils.read_file(absolute_path, self._encoding)
+        return LSPFileBuffer(uri, contents, 0, self.language_id, 0)
+
+    def _index_single_file(self,rel_file_path: str) -> tuple[str, bool, str | None]:
+        """
+        Index a single file by requesting its document symbols.
+        
+        :param abs_file_path: The absolute path of the file to index
+        :param rel_file_path: The relative path of the file to index
+        :return: Tuple of (file_path, success, error_message)
+        """
+        try:
+            # Directly read file content without notifying LSP
+            file_buffer = self.read_file(rel_file_path)
+            # Check if already cached and valid
+            if self.kuzu_cache.is_doc_cached(rel_file_path, file_buffer.content_hash):
+                return (rel_file_path, True, None)
+            
+            # Not cached or outdated, need to index with LSP
+            self.request_document_symbols(rel_file_path,file_buffer,True)
+            
+            return (rel_file_path, True, None)
+        except Exception as e:
+            return (rel_file_path, False, str(e))
+    
+    def build_index(self, rebuild_indexes: bool=False, max_workers: int = 4) -> None:
+        """
+        Build the symbol index for the language server.
+        Traverses all files in the project and requests document symbols to populate the cache.
+        Uses multi-threading to process files within each directory in parallel.
+        
+        :param rebuild_indexes: Whether to clear the existing cache before rebuilding
+        :param max_workers: Maximum number of threads to use for parallel processing (default: 4)
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        if rebuild_indexes:
+            self.kuzu_cache.clear_dir()
+        self.kuzu_cache.start()
+        
+        total_files = 0
+        total_errors = 0
+        
+        # Create a shared thread pool for the entire indexing process
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Helper function to recursively traverse directories and index files
+            def traverse_and_index(rel_dir_path: str) -> None:
+                nonlocal total_files, total_errors
+                
+                abs_dir_path = self.repository_root_path if rel_dir_path == "." else os.path.join(self.repository_root_path, rel_dir_path)
+                abs_dir_path = os.path.realpath(abs_dir_path)
+                
+                if self.is_ignored_path(str(Path(abs_dir_path).relative_to(self.repository_root_path))):
+                    log.debug("Skipping directory during indexing: %s (because it should be ignored)", rel_dir_path)
+                    return
+                
+                try:
+                    contained_items = os.listdir(abs_dir_path)
+                except OSError:
+                    return
+                
+                # Quick filter: skip empty directories
+                if not contained_items:
+                    return
+                
+                # Separate files and subdirectories
+                files_in_dir = []
+                subdirs = []
+                
+                for item_name in contained_items:
+                    item_abs_path = os.path.join(abs_dir_path, item_name)
+                    
+                    # Get relative path
+                    try:
+                        item_rel_path = str(Path(item_abs_path).resolve().relative_to(self.repository_root_path))
+                    except ValueError as e:
+                        log.warning("Skipping path %s during indexing; likely outside of repository root [cause: %s]", item_abs_path, e)
+                        continue
+                    
+                    if self.is_ignored_path(item_rel_path):
+                        continue
+                    
+                    if os.path.isdir(item_abs_path):
+                        subdirs.append(item_rel_path)
+                    elif os.path.isfile(item_abs_path):
+                        files_in_dir.append(item_rel_path)
+                
+                # Process files in current directory using shared thread pool
+                if files_in_dir:
+                    futures = {
+                        executor.submit(self._index_single_file, rel_path): rel_path
+                        for rel_path in files_in_dir
+                    }
+                    
+                    dir_errors = 0
+                    for future in as_completed(futures):
+                        file_path, success, error = future.result()
+                        if success:
+                            total_files += 1
+                        else:
+                            total_errors += 1
+                            dir_errors += 1
+                            log.warning("Failed to index file %s: %s", file_path, error)
+                
+                # Recursively process subdirectories
+                for subdir in subdirs:
+                    traverse_and_index(subdir)
+            
+            # Start traversal from repository root
+            log.info("Starting index build with %d worker threads", max_workers)
+            traverse_and_index(".")
+        
+        log.info("Documents index build complete: %d files indexed, %d errors", total_files, total_errors)

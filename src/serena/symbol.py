@@ -10,7 +10,7 @@ from sensai.util.string import ToStringMixin
 
 from solidlsp import SolidLanguageServer
 from solidlsp.ls import ReferenceInSymbol as LSPReferenceInSymbol
-from solidlsp.ls_types import Position, SymbolKind, UnifiedSymbolInformation
+from solidlsp.ls_types import Position, SymbolKind, UnifiedSymbolInformation, Diagnostic
 
 from .ls_manager import LanguageServerManager
 from .project import Project
@@ -513,10 +513,23 @@ class LanguageServerSymbolRetriever:
         """
         Finds all symbols that match the given name path pattern (see class :class:`NamePathMatcher` for details),
         optionally limited to a specific file and filtered by kind.
+        
+        This method now leverages Kùzu's graph database capabilities for efficient symbol lookup,
+        using Cypher queries to directly match symbol paths without loading entire trees into memory.
         """
+        
         symbols: list[LanguageServerSymbol] = []
         for lang_server in self._ls_manager.iter_language_servers():
-            symbol_roots = lang_server.request_full_symbol_tree(within_relative_path=within_relative_path)
+            # Use the language server's query_symbols_by_pattern method
+            # It handles file vs directory distinction internally
+            symbol_roots = lang_server.search_symbols(
+                name_path_pattern=name_path_pattern,
+                substring_matching=substring_matching,
+                include_kinds=include_kinds,
+                exclude_kinds=exclude_kinds,
+                within_relative_path=within_relative_path
+            )
+            # Now we can directly use the filtered symbols without additional find() call
             for root in symbol_roots:
                 symbols.extend(
                     LanguageServerSymbol(root).find(
@@ -669,6 +682,17 @@ class LanguageServerSymbolRetriever:
             result[file_path] = symbols_in_file
 
         return result
+
+    def request_text_document_diagnostics(self, relative_path: str, timeout: float = 15.0) -> list[Diagnostic]:
+        """
+        Request diagnostics for the given file.
+
+        :param relative_path: the relative path of the file to retrieve diagnostics for
+        :param timeout: timeout in seconds for the request
+        :return: a list of diagnostics for the file
+        """
+        lang_server = self.get_language_server(relative_path)
+        return lang_server.request_text_document_diagnostics(relative_path, timeout=timeout)
 
 
 class JetBrainsSymbol(Symbol):

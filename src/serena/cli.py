@@ -586,7 +586,7 @@ class ProjectCommands(AutoRegisteringGroup):
         proj = Project.load(os.path.abspath(project))
         click.echo(f"Indexing symbols in project {project} …")
         ls_mgr = proj.create_language_server_manager(
-            log_level=lvl, ls_timeout=timeout, ls_specific_settings=serena_config.ls_specific_settings
+            log_level=lvl, ls_timeout=timeout, ls_specific_settings=serena_config.ls_specific_settings,rebuild_indexes=True
         )
         try:
             log_file = os.path.join(project, ".serena", "logs", "indexing.txt")
@@ -602,7 +602,7 @@ class ProjectCommands(AutoRegisteringGroup):
                     ls.request_document_symbols(f)
                     language_file_counts[ls.language] += 1
                 except Exception as e:
-                    log.error(f"Failed to index {f}, continuing.")
+                    log.error(f"Failed to index {f}, {e}, continuing.")
                     collected_exceptions.append(e)
                     files_failed.append(f)
                 if (i + 1) % 10 == 0:

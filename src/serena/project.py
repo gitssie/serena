@@ -199,8 +199,10 @@ class Project(ToStringMixin):
         # Create normalized path for consistent handling
         rel_path = Path(relative_path)
 
-        # always ignore paths inside .git
-        if len(rel_path.parts) > 0 and rel_path.parts[0] == ".git":
+        # Always ignore paths inside version control and other metadata directories
+        # Check any part of the path, not just the first component
+        ignored_dir_names = {".git", ".svn", ".mvn", ".hg", "__pycache__"}
+        if any(part in ignored_dir_names for part in rel_path.parts):
             return True
 
         return match_path(str(relative_path), self.get_ignore_spec(), root_path=self.project_root)
@@ -364,6 +366,7 @@ class Project(ToStringMixin):
         ls_timeout: float | None = DEFAULT_TOOL_TIMEOUT - 5,
         trace_lsp_communication: bool = False,
         ls_specific_settings: dict[Language, Any] | None = None,
+        rebuild_indexes: bool = False,
     ) -> LanguageServerManager:
         """
         Creates the language server manager for the project, starting one language server per configured programming language.
@@ -390,7 +393,7 @@ class Project(ToStringMixin):
             ls_specific_settings=ls_specific_settings,
             trace_lsp_communication=trace_lsp_communication,
         )
-        self.language_server_manager = LanguageServerManager.from_languages(self.project_config.languages, factory)
+        self.language_server_manager = LanguageServerManager.from_languages(self.project_config.languages, factory, rebuild_indexes=rebuild_indexes)
         return self.language_server_manager
 
     def add_language(self, language: Language) -> None:

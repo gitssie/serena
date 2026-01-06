@@ -60,6 +60,8 @@ def _create_ls(
 def start_ls_context(
     language: Language, repo_path: str | None = None, ignored_paths: list[str] | None = None, trace_lsp_communication: bool = False
 ) -> Iterator[SolidLanguageServer]:
+    if repo_path is None:
+        repo_path = str(get_repo_path(language))
     ls = _create_ls(language, repo_path, ignored_paths, trace_lsp_communication)
     log.info(f"Starting language server for {language} {repo_path}")
     ls.start()

@@ -3,6 +3,7 @@ Provides Java specific instantiation of the LanguageServer class. Contains vario
 """
 
 import dataclasses
+import hashlib
 import logging
 import os
 import pathlib
@@ -16,6 +17,7 @@ from overrides import override
 
 from solidlsp.ls import LSPFileBuffer, SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig
+from solidlsp import ls_types
 from solidlsp.ls_types import UnifiedSymbolInformation
 from solidlsp.ls_utils import FileUtils, PlatformUtils
 from solidlsp.lsp_protocol_handler.lsp_types import DocumentSymbol, InitializeParams, SymbolInformation
@@ -71,12 +73,14 @@ class EclipseJDTLS(SolidLanguageServer):
         self.runtime_dependency_paths = runtime_dependency_paths
 
         # ws_dir is the workspace directory for the EclipseJDTLS server
+        # Use a deterministic workspace directory based on the repository path to enable incremental compilation/caching
+        repo_hash = hashlib.md5(repository_root_path.encode("utf-8")).hexdigest()
         ws_dir = str(
             PurePath(
                 solidlsp_settings.ls_resources_dir,
                 "EclipseJDTLS",
                 "workspaces",
-                uuid.uuid4().hex,
+                repo_hash,
             )
         )
 
@@ -124,16 +128,15 @@ class EclipseJDTLS(SolidLanguageServer):
             "-Declipse.product=org.eclipse.jdt.ls.core.product",
             "-Djava.import.generatesMetadataFilesAtProjectRoot=false",
             "-Dfile.encoding=utf8",
-            "-noverify",
             "-XX:+UseParallelGC",
             "-XX:GCTimeRatio=4",
             "-XX:AdaptiveSizePolicyWeight=90",
             "-Dsun.zip.disableMemoryMapping=true",
             "-Djava.lsp.joinOnCompletion=true",
-            "-Xmx3G",
-            "-Xms100m",
+            "-Xmx6G",
+            "-Xms1G",
             "-Xlog:disable",
-            "-Dlog.level=ALL",
+            "-Dlog.level=WARNING",
             f"-javaagent:{lombok_jar_path}",
             f"-Djdt.core.sharedIndexLocation={shared_cache_location}",
             "-jar",
@@ -147,6 +150,10 @@ class EclipseJDTLS(SolidLanguageServer):
         self.service_ready_event = threading.Event()
         self.intellicode_enable_command_available = threading.Event()
         self.initialize_searcher_command_available = threading.Event()
+        
+        # For handling async publishDiagnostics notifications
+        self._diagnostics_waiters: dict[str, dict] = {}
+        self._diagnostics_lock = threading.Lock()
 
         super().__init__(
             config, repository_root_path, ProcessLaunchInfo(cmd, proc_env, proc_cwd), "java", solidlsp_settings=solidlsp_settings
@@ -160,15 +167,81 @@ class EclipseJDTLS(SolidLanguageServer):
         # - Eclipse: bin, .settings
         # - IntelliJ IDEA: out, .idea
         # - General: classes, dist, lib
+        # - VCS: .git
         return super().is_ignored_dirname(dirname) or dirname in [
             "target",  # Maven
             "build",  # Gradle
+            ".gradle",  # Gradle
             "bin",  # Eclipse
+            ".settings",  # Eclipse
             "out",  # IntelliJ IDEA
+            ".idea",  # IntelliJ IDEA
             "classes",  # General
             "dist",  # General
             "lib",  # General
+            ".git",  # VCS
         ]
+    
+    @override
+    def request_text_document_diagnostics(self, relative_file_path: str, timeout: float = 15.0) -> list[ls_types.Diagnostic]:
+        """
+        Override base implementation to handle JDTLS's push-based diagnostics.
+        
+        JDTLS doesn't support textDocument/diagnostic requests (LSP 3.17).
+        Instead, it pushes diagnostics via textDocument/publishDiagnostics notifications.
+        This method waits for such notifications.
+        
+        :param relative_file_path: The relative path of the file to retrieve diagnostics for
+        :param timeout: Maximum time to wait for diagnostics (default: 15.0 seconds)
+        :return: A list of diagnostics for the file
+        """
+        from solidlsp.ls_exceptions import SolidLSPException
+        
+        if not self.server_started:
+            log.error("request_text_document_diagnostics called before Language Server started")
+            raise SolidLSPException("Language Server not started")
+        
+        self._validate_file_path(relative_file_path)
+        
+        with self.open_file(relative_file_path):
+            uri = pathlib.Path(str(PurePath(self.repository_root_path, relative_file_path))).as_uri()
+            
+            # Create waiter for this file
+            waiter = {
+                'event': threading.Event(),
+                'diagnostics': None
+            }
+            
+            with self._diagnostics_lock:
+                self._diagnostics_waiters[uri] = waiter
+            
+            try:
+                # Wait for publishDiagnostics notification
+                if waiter['event'].wait(timeout):
+                    diagnostics = waiter['diagnostics']
+                    if diagnostics is None:
+                        return []
+                    
+                    # Convert to ls_types.Diagnostic format
+                    from solidlsp import ls_types
+                    ret: list[ls_types.Diagnostic] = []
+                    for item in diagnostics:
+                        new_item: ls_types.Diagnostic = {
+                            "uri": uri,
+                            "severity": item.get("severity", 1),
+                            "message": item.get("message", ""),
+                            "range": item["range"],
+                            "code": item.get("code"),
+                        }
+                        ret.append(new_item)
+                    return ret
+                else:
+                    log.warning(f"Timeout ({timeout}s) waiting for diagnostics for {relative_file_path}")
+                    return []
+            finally:
+                # Clean up waiter immediately after use
+                with self._diagnostics_lock:
+                    self._diagnostics_waiters.pop(uri, None)
 
     @classmethod
     def _setupRuntimeDependencies(cls, config: LanguageServerConfig, solidlsp_settings: SolidLSPSettings) -> RuntimeDependencyPaths:
@@ -227,13 +300,13 @@ class EclipseJDTLS(SolidLanguageServer):
                     "jdtls_readonly_config_path": "extension/server/config_linux",
                 },
                 "win-x64": {
-                    "url": "https://github.com/redhat-developer/vscode-java/releases/download/v1.42.0/java-win32-x64-1.42.0-561.vsix",
+                    "url": "https://github.com/redhat-developer/vscode-java/releases/download/v1.50.0/java-win32-x64-1.50.0-769.vsix",
                     "archiveType": "zip",
                     "relative_extraction_path": "vscode-java",
-                    "jre_home_path": "extension/jre/21.0.7-win32-x86_64",
-                    "jre_path": "extension/jre/21.0.7-win32-x86_64/bin/java.exe",
-                    "lombok_jar_path": "extension/lombok/lombok-1.18.36.jar",
-                    "jdtls_launcher_jar_path": "extension/server/plugins/org.eclipse.equinox.launcher_1.7.0.v20250424-1814.jar",
+                    "jre_home_path": "extension/jre/21.0.9-win32-x86_64",
+                    "jre_path": "extension/jre/21.0.9-win32-x86_64/bin/java.exe",
+                    "lombok_jar_path": "extension/lombok/lombok-1.18.39-4050.jar",
+                    "jdtls_launcher_jar_path": "extension/server/plugins/org.eclipse.equinox.launcher_1.7.100.v20251111-0406.jar",
                     "jdtls_readonly_config_path": "extension/server/config_win",
                 },
             },
@@ -559,45 +632,53 @@ class EclipseJDTLS(SolidLanguageServer):
                         "jdt": {
                             "ls": {
                                 "java": {"home": None},
-                                "vmargs": "-XX:+UseParallelGC -XX:GCTimeRatio=4 -XX:AdaptiveSizePolicyWeight=90 -Dsun.zip.disableMemoryMapping=true -Xmx1G -Xms100m -Xlog:disable",
+                                "vmargs": "-XX:+UseParallelGC -XX:GCTimeRatio=4 -XX:AdaptiveSizePolicyWeight=90 -Dsun.zip.disableMemoryMapping=true -Xmx3G -Xms100m -Xlog:disable -Declipse.p2.unsignedPolicy=allow",
                                 "lombokSupport": {"enabled": True},
-                                "protobufSupport": {"enabled": True},
-                                "androidSupport": {"enabled": True},
+                                "protobufSupport": {"enabled": False},
+                                "androidSupport": {"enabled": False},
                             }
                         },
-                        "errors": {"incompleteClasspath": {"severity": "error"}},
+                        "errors": {
+                            "incompleteClasspath": {"severity": "ignore"},
+                            "unlikelyArgumentCheck": {"severity": "ignore"},
+                        },
+                        "problems": {
+                            "unlikelyArgumentType": "ignore",
+                            "unlikelyEqualsArgumentType": "ignore",
+                        },
                         "configuration": {
                             "checkProjectSettingsExclusions": False,
                             "updateBuildConfiguration": "interactive",
                             "maven": {
                                 "userSettings": maven_settings_path,
                                 "globalSettings": None,
-                                "notCoveredPluginExecutionSeverity": "warning",
+                                "notCoveredPluginExecutionSeverity": "ignore",
                                 "defaultMojoExecutionAction": "ignore",
+                                "offline": {"enabled": True},
                             },
-                            "workspaceCacheLimit": 90,
+                            "workspaceCacheLimit": 1000,
                             "runtimes": [
                                 {"name": "JavaSE-21", "path": "static/vscode-java/extension/jre/21.0.7-linux-x86_64", "default": True}
                             ],
                         },
-                        "trace": {"server": "verbose"},
+                        "trace": {"server": "off"},
                         "import": {
                             "maven": {
                                 "enabled": True,
                                 "offline": {"enabled": False},
-                                "disableTestClasspathFlag": False,
+                                "disableTestClasspathFlag": True,
                             },
                             "gradle": {
-                                "enabled": True,
+                                "enabled": False,
                                 "wrapper": {"enabled": False},
                                 "version": None,
-                                "home": "abs(static/gradle-7.3.3)",
-                                "java": {"home": "abs(static/launch_jres/21.0.7-linux-x86_64)"},
+                                "home": "abs(static/gradle-8.14.2)",
+                                "java": {"home": "abs(static/vscode-java/extension/jre/21.0.7-linux-x86_64)"},
                                 "offline": {"enabled": False},
                                 "arguments": None,
                                 "jvmArguments": None,
                                 "user": {"home": gradle_user_home},
-                                "annotationProcessing": {"enabled": True},
+                                "annotationProcessing": {"enabled": False},
                             },
                             "exclusions": [
                                 "**/node_modules/**",
@@ -609,15 +690,15 @@ class EclipseJDTLS(SolidLanguageServer):
                         },
                         # Set updateSnapshots to False to improve performance and avoid unnecessary network calls
                         # Snapshots will only be updated when explicitly requested by the user
-                        "maven": {"downloadSources": True, "updateSnapshots": False},
-                        "eclipse": {"downloadSources": True},
-                        "signatureHelp": {"enabled": True, "description": {"enabled": True}},
-                        "implementationsCodeLens": {"enabled": True},
+                        "maven": {"downloadSources": False, "updateSnapshots": False},
+                        "eclipse": {"downloadSources": False},
+                        "signatureHelp": {"enabled": False, "description": {"enabled": False}},
+                        "implementationsCodeLens": {"enabled": False},
                         "format": {
-                            "enabled": True,
+                            "enabled": False,
                             "settings": {"url": None, "profile": None},
-                            "comments": {"enabled": True},
-                            "onType": {"enabled": True},
+                            "comments": {"enabled": False},
+                            "onType": {"enabled": False},
                             "insertSpaces": True,
                             "tabSize": 4,
                         },
@@ -625,56 +706,57 @@ class EclipseJDTLS(SolidLanguageServer):
                         "project": {
                             "referencedLibraries": ["lib/**/*.jar"],
                             "importOnFirstTimeStartup": "automatic",
-                            "importHint": True,
+                            "importHint": False,
                             "resourceFilters": ["node_modules", "\\.git"],
                             "encoding": "ignore",
                             "exportJar": {"targetPath": "${workspaceFolder}/${workspaceFolderBasename}.jar"},
                         },
                         "contentProvider": {"preferred": None},
                         "autobuild": {"enabled": True},
-                        "maxConcurrentBuilds": 1,
-                        "selectionRange": {"enabled": True},
-                        "showBuildStatusOnStart": {"enabled": "notification"},
+                        "maxConcurrentBuilds": 8,
+                        "selectionRange": {"enabled": False},
+                        "showBuildStatusOnStart": {"enabled": "off"},
                         "server": {"launchMode": "Standard"},
                         "sources": {"organizeImports": {"starThreshold": 99, "staticStarThreshold": 99}},
                         "imports": {"gradle": {"wrapper": {"checksums": []}}},
                         "templates": {"fileHeader": [], "typeComment": []},
-                        "references": {"includeAccessors": True, "includeDecompiledSources": True},
-                        "typeHierarchy": {"lazyLoad": False},
+                        "references": {"includeAccessors": False, "includeDecompiledSources": False},
+                        "typeHierarchy": {"lazyLoad": True},
                         "settings": {"url": None},
-                        "symbols": {"includeSourceMethodDeclarations": False},
-                        "inlayHints": {"parameterNames": {"enabled": "literals", "exclusions": []}},
+                        "symbols": {"includeSourceMethodDeclarations": True},
+                        "inlayHints": {"parameterNames": {"enabled": "none", "exclusions": []}},
                         "codeAction": {"sortMembers": {"avoidVolatileChanges": True}},
                         "compile": {
                             "nullAnalysis": {
-                                "nonnull": [
-                                    "javax.annotation.Nonnull",
-                                    "org.eclipse.jdt.annotation.NonNull",
-                                    "org.springframework.lang.NonNull",
-                                ],
-                                "nullable": [
-                                    "javax.annotation.Nullable",
-                                    "org.eclipse.jdt.annotation.Nullable",
-                                    "org.springframework.lang.Nullable",
-                                ],
-                                "mode": "automatic",
-                            }
+                                "mode": "disabled",
+                            },
+                            "unlikelyArgumentType": "ignore",
+                            "unlikelyEqualsArgumentType": "ignore",
                         },
+                        "completion": {
+                            "enabled": True,
+                            "overwrite": False,
+                            "guessMethodArguments": False,
+                            "filteredTypes": [],
+                            "favoriteStaticMembers": [],
+                            "importOrder": [],
+                        },
+                        "progressReports": {"enabled": False},
                         "sharedIndexes": {"enabled": "auto", "location": ""},
-                        "silentNotification": False,
+                        "silentNotification": True,
                         "dependency": {
                             "showMembers": False,
-                            "syncWithFolderExplorer": True,
-                            "autoRefresh": True,
+                            "syncWithFolderExplorer": False,
+                            "autoRefresh": False,
                             "refreshDelay": 2000,
                             "packagePresentation": "flat",
                         },
-                        "help": {"firstView": "auto", "showReleaseNotes": True, "collectErrorLog": False},
+                        "help": {"firstView": "auto", "showReleaseNotes": False, "collectErrorLog": False},
                         "test": {"defaultConfig": "", "config": {}},
                     }
                 },
             },
-            "trace": "verbose",
+            "trace": "off",
             "processId": os.getpid(),
             "workspaceFolders": [
                 {
@@ -687,9 +769,40 @@ class EclipseJDTLS(SolidLanguageServer):
         initialize_params["initializationOptions"]["workspaceFolders"] = [repo_uri]  # type: ignore
         bundles = [self.runtime_dependency_paths.intellicode_jar_path]
         initialize_params["initializationOptions"]["bundles"] = bundles  # type: ignore
-        initialize_params["initializationOptions"]["settings"]["java"]["configuration"]["runtimes"] = [  # type: ignore
-            {"name": "JavaSE-21", "path": self.runtime_dependency_paths.jre_home_path, "default": True}
-        ]
+        
+        # Configure Java runtimes - allow user to specify additional JDKs
+        runtimes = []
+        has_user_default = False
+        
+        # Add user-configured JDK runtimes from ls_specific_settings first
+        custom_runtimes = self._custom_settings.get("java_runtimes", [])
+        if custom_runtimes:
+            for custom_runtime in custom_runtimes:
+                if "name" in custom_runtime and "path" in custom_runtime:
+                    runtime_path = custom_runtime["path"]
+                    if os.path.exists(runtime_path):
+                        is_default = custom_runtime.get("default", False)
+                        if is_default:
+                            has_user_default = True
+                        runtimes.append({
+                            "name": custom_runtime["name"],
+                            "path": runtime_path,
+                            "default": is_default
+                        })
+                        log.info(f"Added custom Java runtime: {custom_runtime['name']} at {runtime_path} (default={is_default})")
+                    else:
+                        log.warning(f"Custom Java runtime path not found: {runtime_path}")
+        
+        # Always add bundled Java 21 (required for JDTLS server compatibility)
+        # Set it as default only if user hasn't specified a default runtime
+        runtimes.append({
+            "name": "JavaSE-21",
+            "path": self.runtime_dependency_paths.jre_home_path,
+            "default": not has_user_default
+        })
+        log.info(f"Added bundled Java 21 runtime (default={not has_user_default})")
+        
+        initialize_params["initializationOptions"]["settings"]["java"]["configuration"]["runtimes"] = runtimes  # type: ignore
 
         for runtime in initialize_params["initializationOptions"]["settings"]["java"]["configuration"]["runtimes"]:  # type: ignore
             assert "name" in runtime
@@ -742,13 +855,27 @@ class EclipseJDTLS(SolidLanguageServer):
         def do_nothing(params: dict) -> None:
             return
 
+        def on_publish_diagnostics(params: dict) -> None:
+            """Handle textDocument/publishDiagnostics notification from JDTLS."""
+            uri = params.get('uri')
+            diagnostics = params.get('diagnostics', [])
+            if len(diagnostics) > 0:
+                log.debug(f"Received textDocument/publishDiagnostics: uri={uri}, diagnostics_count={len(diagnostics)}")
+            
+            # Notify any waiting request_text_document_diagnostics calls
+            with self._diagnostics_lock:
+                if uri in self._diagnostics_waiters:
+                    waiter = self._diagnostics_waiters[uri]
+                    waiter['diagnostics'] = diagnostics
+                    waiter['event'].set()
+
         self.server.on_request("client/registerCapability", register_capability_handler)
         self.server.on_notification("language/status", lang_status_handler)
         self.server.on_notification("window/logMessage", window_log_message)
         self.server.on_request("workspace/executeClientCommand", execute_client_command_handler)
         self.server.on_notification("$/progress", do_nothing)
-        self.server.on_notification("textDocument/publishDiagnostics", do_nothing)
         self.server.on_notification("language/actionableNotification", do_nothing)
+        self.server.on_notification("textDocument/publishDiagnostics", on_publish_diagnostics)
 
         log.info("Starting EclipseJDTLS server process")
         self.server.start()

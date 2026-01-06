@@ -328,6 +328,7 @@ def search_files(
     context_lines_after: int = 0,
     paths_include_glob: str | None = None,
     paths_exclude_glob: str | None = None,
+    max_matches: int = 20,
 ) -> list[MatchedConsecutiveLines]:
     """
     Search for a pattern in a list of files.
@@ -341,6 +342,7 @@ def search_files(
     :param context_lines_after: Number of context lines to include after matches
     :param paths_include_glob: Optional glob pattern to include files from the list
     :param paths_exclude_glob: Optional glob pattern to exclude files from the list
+    :param max_matches: Maximum number of matches to return. Default is 20.
     :return: List of MatchedConsecutiveLines objects
     """
     # Pre-filter paths (done sequentially to avoid overhead)
@@ -399,6 +401,11 @@ def search_files(
             skipped_file_error_tuples.append((result["path"], result["error"]))
         else:
             matches.extend(result["results"])
+            # Check if we've reached the max_matches limit
+            if len(matches) >= max_matches:
+                matches = matches[:max_matches]
+                log.info(f"Reached max_matches limit of {max_matches}, stopping collection")
+                break
 
     if skipped_file_error_tuples:
         log.debug(f"Failed to read {len(skipped_file_error_tuples)} files: {skipped_file_error_tuples}")
