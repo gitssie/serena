@@ -341,7 +341,7 @@ class SourceKitLSP(SolidLanguageServer):
         self._initialization_timestamp = time.time()
 
     @override
-    def request_references(self, relative_file_path: str, line: int, column: int) -> list[ls_types.Location]:
+    def request_references(self, relative_file_path: str, line: int, column: int, max_matches: int = 50) -> list[ls_types.Location]:
         # SourceKit LSP needs initialization + indexing time after startup
         # before it can provide accurate reference information. This sleep
         # prevents race conditions where references might not be available yet.

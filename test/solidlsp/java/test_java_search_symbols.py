@@ -40,9 +40,10 @@ class TestJavaSearchSymbols:
         serena_config = SerenaConfig.from_config_file()
         proj = Project.load(os.path.abspath(project))
         ls_mgr = proj.create_language_server_manager(
-            log_level=lvl, ls_timeout=timeout, ls_specific_settings=serena_config.ls_specific_settings,rebuild_indexes=True
+            log_level=lvl, ls_timeout=timeout, ls_specific_settings=serena_config.ls_specific_settings
         )
         try:
+            appender = proj.init_index_cache(clear_data=True,batch_mode=True)
             files = proj.gather_source_files()
             collected_exceptions: list[Exception] = []
             files_failed = []
@@ -50,14 +51,17 @@ class TestJavaSearchSymbols:
             for i, f in enumerate(tqdm(files, desc="Indexing")):
                 try:
                     ls = ls_mgr.get_language_server(f)
-                    ls.request_document_symbols(f)
+                    ls.build_index(f, appender=appender.get(ls.language))
                     language_file_counts[ls.language] += 1
                 except Exception as e:
                     collected_exceptions.append(e)
                     files_failed.append(f)
                 if (i + 1) % 10 == 0:
                     ls_mgr.save_all_caches()
-            ls_mgr.save_all_caches()
+            
+            for app in appender.values():
+                app.commit()
+            
             if len(files_failed) > 0:
                 # Don't raise in tests; just log
                 import logging as _logging
@@ -490,3 +494,51 @@ class TestLanguageServerSymbolRetriever:
         # Verify printHello method is in children
         child_names = [c["name"] for c in children]
         assert "printHello" in child_names, "Should include printHello method as child"
+
+
+    def test_search_ofield_in_crm_hc(self) -> None:
+        """Test searching for OField symbol in E:\\worksapce\\upgrade\\crm-hc project."""
+        import logging
+        from sensai.util.logging import configure
+        from serena.config.serena_config import SerenaConfig
+        from serena.project import Project
+        
+        # Setup logging
+        lvl = logging.DEBUG
+        configure(level=lvl)
+        
+        # Enable DEBUG for kuzu_symbol_cache module
+        logging.getLogger("solidlsp.util.kuzu_symbol_cache").setLevel(logging.DEBUG)
+        
+        # Load project configuration
+        serena_config = SerenaConfig.from_config_file()
+        project_path = "E:/worksapce/upgrade/crm-hc"
+        proj = Project.load(os.path.abspath(project_path))
+        
+        # Create language server manager with rebuild_indexes=True
+        timeout = 30.0
+        ls_mgr = proj.create_language_server_manager(
+            log_level=lvl, 
+            ls_timeout=timeout, 
+            ls_specific_settings=serena_config.ls_specific_settings
+        )
+        proj.init_index_cache()
+        try:
+            ls = ls_mgr._default_language_server
+            # Search for OField symbol
+            symbols = ls.search_symbols(name_path_pattern="OField") 
+            # Verify results
+            assert len(symbols) > 0, "Should find OField symbol in the project"
+            
+            for symbol in symbols:
+                assert "name" in symbol, "Symbol should have name"
+                assert "kind" in symbol, "Symbol should have kind"
+                assert "location" in symbol, "Symbol should have location"
+                
+                # Log found symbol information
+                logging.info(f"Found symbol: {symbol['name']} (kind: {symbol['kind']}) in {symbol['location'].get('relativePath', 'N/A')}")
+        
+        finally:
+            # Always stop all language servers
+            ls_mgr.stop_all()
+

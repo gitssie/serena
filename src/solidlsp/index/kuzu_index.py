@@ -28,14 +28,16 @@ except ImportError:
     kuzu = None
 
 from solidlsp import ls_types
+from .symbol_index import SymbolIndex,SymbolAppender,SingleAppender
 
 log = logging.getLogger(__name__)
 
 
-class KuzuSymbolCache:
+class KuzuIndex(SymbolIndex):
     """
     Graph-based symbol cache using Kùzu database.
     
+    Implements SymbolIndex interface with Kùzu as the storage backend.
     Stores doc symbols as nodes and their relationships as edges,
     enabling efficient queries and automatic circular reference handling.
     """
@@ -59,6 +61,11 @@ class KuzuSymbolCache:
         self.db = None
         self.conn = None
     
+    def is_started(self) -> bool:
+        """Check if the database connection is started."""
+        with self._lock:
+            return self.conn is not None
+
     def start(self) -> None:
         """Start the database connection and initialize schema."""
         with self._lock:
@@ -73,6 +80,17 @@ class KuzuSymbolCache:
             self._init_schema()
             
             log.info(f"Started Kùzu symbol cache at {db_path}")
+    
+    def stop(self) -> None:
+        """Stop the database connection and release resources."""
+        with self._lock:
+            if self.conn is None:
+                return  # Already stopped
+            
+            # Kùzu Python bindings don't have explicit close()
+            # Setting to None allows Python GC to clean up
+            self.conn = None
+            self.db = None
     
     def _init_schema(self) -> None:
         """Initialize the graph database schema."""
@@ -248,31 +266,7 @@ class KuzuSymbolCache:
                 'file_symbol': doc_symbol,
                 'content_hash': content_hash
             }
-    
-    def query_symbols_by_name(self, name: str) -> List[Dict[str, Any]]:
-        """
-        Query all symbols with a given name across all docs.
-        
-        :param name: Symbol name to search
-        :return: List of symbols matching the name
-        """
-        with self._lock:
-            result = self.conn.execute(
-                "MATCH (d:Doc)-[:DEFINES]->(s:Symbol) WHERE s.name = $name RETURN d.relative_path, s.start_line, s.kind, s.id",
-                {"name": name}
-            )
-            
-            symbols = []
-            while result.has_next():
-                row = result.get_next()
-                symbols.append({
-                    'relative_path': row[0],
-                    'line': row[1],
-                    'kind': row[2],
-                    'id': row[3]
-                })
-            
-            return symbols
+
     
     def query_symbols(
         self,
@@ -337,6 +331,8 @@ class KuzuSymbolCache:
                 )
             
             log.debug(f"Executing Cypher query: {cypher_query}")
+            import time
+            start_time = time.perf_counter()
             result = self.conn.execute(cypher_query)
             
             # Collect matching symbol IDs
@@ -345,10 +341,15 @@ class KuzuSymbolCache:
                 row = result.get_next()
                 symbol_ids.append(row[0])  # symbol_id is first column
             
-            # Build Doc symbols grouped by doc with matching symbols as children
-            doc_symbols = self._group_symbols_by_doc(symbol_ids)
+            query_time = time.perf_counter() - start_time
             
-            log.debug(f"Found {len(doc_symbols)} docs with symbols matching pattern '{name_path_pattern}'")
+            # Build Doc symbols grouped by doc with matching symbols as children
+            group_start_time = time.perf_counter()
+            doc_symbols = self._group_symbols_by_doc(symbol_ids)
+            group_time = time.perf_counter() - group_start_time
+            
+            total_time = time.perf_counter() - start_time
+            log.debug(f"Found {len(doc_symbols)} docs with symbols matching pattern '{name_path_pattern}' (query: {query_time:.3f}s, group: {group_time:.3f}s, total: {total_time:.3f}s)")
             return doc_symbols
     
     def _build_simple_name_query(
@@ -505,28 +506,7 @@ class KuzuSymbolCache:
             query += "\n RETURN target.id AS symbol_id"
         
         return query
-    
-    def get_symbol_chain(self, symbol_id: str) -> Optional[List[Dict[str, Any]]]:
-        """
-        Get the full parent chain of a symbol (from root to leaf).
-        
-        :param symbol_id: ID of the symbol
-        :return: List of symbols from root to the target symbol
-        """
-        with self._lock:
-            # Find all ancestor symbols
-            result = self.conn.execute(
-                "MATCH path = (root:Symbol)<-[:PARENT_OF*]-(s:Symbol {id: $symbol_id}) WHERE NOT EXISTS { MATCH (parent:Symbol)-[:PARENT_OF]->(root) } RETURN [node IN nodes(path) | node.id] AS chain",
-                {"symbol_id": symbol_id}
-            )
-            if result.has_next():
-                chain_ids = result.get_next()[0]
-                return [self._get_symbol_by_id(sid) for sid in reversed(chain_ids)]
-            else:
-                # No ancestors, just return the symbol itself
-                sym = self._get_symbol_by_id(symbol_id)
-                return [sym] if sym else None
-    
+
     def invalidate_doc(self, relative_path: str) -> None:
         """
         Invalidate cache for a specific doc.
@@ -541,10 +521,9 @@ class KuzuSymbolCache:
     def clear_all(self) -> None:
         """Clear all symbols from the cache."""
         with self._lock:
-            # Delete all relationships and nodes
-            self.conn.execute("MATCH (s:Symbol) DELETE s")
-            self.conn.execute("MATCH (d:Doc) DELETE d")
-            log.info("Cleared all symbols from Kùzu cache")
+            if not self.is_started():
+                return
+            self.conn.execute("MATCH (n) DETACH DELETE n")
     
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get statistics about the cache."""
@@ -588,17 +567,36 @@ class KuzuSymbolCache:
             
             return docs
     
+    def create_appender(self, batch_mode: bool = False) -> SymbolAppender:
+        """
+        创建符号追加器。
+        
+        :param batch_mode: 是否使用批量模式（Kuzu 暂不支持批量模式）
+        :return: SingleAppender 实例
+        
+        注意：Kuzu 当前实现总是返回 SingleAppender（每次立即提交）。
+        """
+        return SingleAppender(self)
+    
     # ======================== Private Helper Methods ========================
     
     def _make_doc_id(self, relative_path: str) -> str:
         """Generate a unique ID for a doc."""
-        return hashlib.md5(f"doc://{relative_path.replace(chr(92), '/')}".encode("utf-8")).hexdigest()  # normalize backslashes
+        return hashlib.blake2b(f"doc://{relative_path.replace(chr(92), '/')}".encode("utf-8"), digest_size=16).hexdigest()  # normalize backslashes
     
-    def _make_symbol_id(self, doc_id: str, symbol_name: str, start_line: int = 0, start_char: int = 0, overload_idx: int = 0) -> str:
-        """Generate a unique ID for a symbol using name, position, and optional overload index."""
+    def _make_symbol_id(self, doc_id: str, parent_symbol_id: Optional[str], symbol_name: str, start_line: int = 0, start_char: int = 0, overload_idx: int = 0) -> str:
+        """Generate a unique ID for a symbol using name, position, parent, and optional overload index."""
+        # Build base ID string with parent context
+        if parent_symbol_id:
+            base_id = f"sym://{doc_id}::{parent_symbol_id}::{symbol_name}@{start_line}:{start_char}"
+        else:
+            base_id = f"sym://{doc_id}::{symbol_name}@{start_line}:{start_char}"
+        
+        # Add overload index if present
         if overload_idx > 0:
-            return hashlib.md5(f"sym://{doc_id}::{symbol_name}@{start_line}:{start_char}#{overload_idx}".encode("utf-8")).hexdigest()
-        return hashlib.md5(f"sym://{doc_id}::{symbol_name}@{start_line}:{start_char}".encode("utf-8")).hexdigest()
+            base_id += f"#{overload_idx}"
+        
+        return hashlib.blake2b(base_id.encode("utf-8"), digest_size=16).hexdigest()
     
     def is_doc_cached(self, relative_path: str, content_hash: str) -> bool:
         """
@@ -618,7 +616,7 @@ class KuzuSymbolCache:
     def _is_cache_valid(self, doc_id: str, content_hash: str) -> bool:
         """Check if cached symbols are still valid."""
         result = self.conn.execute(
-            "MATCH (d:Doc {id: $doc_id}) RETURN d.content_hash AS hash, d.schema_version AS schema_version",
+            "MATCH (d:Doc {id: $doc_id}) RETURN d.content_hash AS hash",
             {"doc_id": doc_id}
         )
         
@@ -626,8 +624,7 @@ class KuzuSymbolCache:
         if result.has_next():
             row = result.get_next()
             stored_hash = row[0]  # hash
-            schema_version = row[1] if len(row) > 1 else 0  # schema_version
-            return stored_hash == content_hash and schema_version == self.SCHEMA_VERSION
+            return stored_hash == content_hash
         
         return False
     
@@ -669,7 +666,7 @@ class KuzuSymbolCache:
             overload_idx = symbol.get('overload_idx', 0)
             start_line = start.get('line', 0)
             start_char = start.get('character', 0)
-            symbol_id = self._make_symbol_id(doc_id, symbol['name'], start_line, start_char, overload_idx)
+            symbol_id = self._make_symbol_id(doc_id, parent_symbol_id, symbol['name'], start_line, start_char, overload_idx)
 
             body = symbol.get('body', '')
             name = symbol['name']
@@ -719,134 +716,153 @@ class KuzuSymbolCache:
         """
         Group symbol IDs by doc and return Doc symbols with complete path chains.
         
-        Uses a single Cypher query to leverage graph database capabilities:
-        - PART_OF for fast deep symbol lookup
-        - PARENT_OF path traversal to root
-        - UNWIND to extract all nodes in path
-        All path traversal happens in the database, Python only assembles results.
+        Optimized approach using batch queries:
+        1. Get docs and matched symbols in one query
+        2. For each doc, fetch all PART_OF symbols and PARENT_OF relationships in batch
+        3. Build tree in Python (fast in-memory operation)
         
         :param symbol_ids: List of symbol IDs to group
-        :return: List of Doc symbol dictionaries with path-based children
+        :return: List of Doc symbol dictionaries with filtered trees
         """
         if not symbol_ids:
             return []
+        
+        import time
+        start = time.perf_counter()
         
         # Build IN clause for batch query
         ids_clause = "', '".join(symbol_ids)
         
         log.debug(f"Querying {len(symbol_ids)} symbols from graph database")
         
-        # Simplified query: Get matched symbols with their docs first
-        # Then for each, query its path separately in Python (temporary for debugging)
+        # Step 1: Get docs with their matched symbols
         result = self.conn.execute(f"""
             MATCH (d:Doc)-[:PART_OF]->(matched:Symbol)
             WHERE matched.id IN ['{ids_clause}']
-            MATCH (d)-[:DEFINES]->(root:Symbol)
-            MATCH path = (root)-[:PARENT_OF*0..]->(matched)
-            UNWIND nodes(path) AS node
-            RETURN DISTINCT
-                matched.id AS matched_id,
-                d.id AS doc_id,
-                d.name AS doc_name,
-                d.relative_path AS doc_path,
-                d.content_hash AS doc_hash,
-                node.id AS node_id,
-                node.name AS node_name,
-                node.kind AS node_kind,
-                node.start_line AS node_start_line,
-                node.start_char AS node_start_char,
-                node.end_line AS node_end_line,
-                node.end_char AS node_end_char,
-                node.body AS node_body,
-                node.overload_idx AS node_overload_idx
-            ORDER BY matched_id, node_start_line
+            RETURN d.id AS doc_id,
+                   d.name AS doc_name,
+                   d.relative_path AS doc_path,
+                   d.content_hash AS doc_hash,
+                   COLLECT(DISTINCT matched.id) AS matched_ids
         """)
         
-        # Reconstruct path structures from flat query results
-        # Build paths by matched symbol, then group by document ID
-        doc_data: Dict[str, Dict[str, Any]] = {}  # doc_id -> doc_info and paths
-        path_builder: Dict[str, tuple] = {}  # matched_id -> (doc_id, [nodes])
-        node_cache: Dict[str, Dict[str, Any]] = {}  # Cache all node info to avoid re-querying
-        
+        docs_info = []
         while result.has_next():
             row = result.get_next()
-            matched_id = row[0]
-            doc_id = row[1]
-            doc_name = row[2]
-            doc_path = row[3]
-            doc_hash = row[4]
-            
-            # Store doc info by doc_id (unique key)
-            if doc_id not in doc_data:
-                doc_data[doc_id] = {
-                    'doc_info': {
-                        'id': doc_id,
-                        'name': doc_name,
-                        'relative_path': doc_path,
-                        'content_hash': doc_hash
-                    },
-                    'paths': []  # Will collect paths belonging to this doc
-                }
-            
-            # Build node info from query result
-            node_id = row[5]
-            node_info = {
-                'id': node_id,
-                'name': row[6],
-                'kind': row[7],
-                'range': {
-                    'start': {'line': row[8], 'character': row[9]},
-                    'end': {'line': row[10], 'character': row[11]}
-                },
-                'selectionRange': {
-                    'start': {'line': row[8], 'character': row[9]},
-                    'end': {'line': row[10], 'character': row[11]}
-                },
-                'location': {
-                    'range': {
-                        'start': {'line': row[8], 'character': row[9]},
-                        'end': {'line': row[10], 'character': row[11]}
-                    }
-                },
-                'body': row[12],
-                'overload_idx': row[13]
-            }
-            
-            # Cache node info for reuse
-            if node_id not in node_cache:
-                node_cache[node_id] = node_info
-            
-            # Group nodes by matched symbol (each matched symbol has one path)
-            if matched_id not in path_builder:
-                path_builder[matched_id] = (doc_id, [])
-            path_builder[matched_id][1].append(node_info)
+            docs_info.append({
+                'doc_id': row[0],
+                'doc_name': row[1],
+                'doc_path': row[2],
+                'doc_hash': row[3],
+                'matched_ids': set(row[4])
+            })
         
-        # Convert node lists to path ID lists and group by document
-        for matched_id, (doc_id, nodes) in path_builder.items():
-            # Nodes are already in root->matched order from query
-            path_ids = [node['id'] for node in nodes]
-            doc_data[doc_id]['paths'].append(path_ids)
+        step1_time = time.perf_counter() - start
+        log.debug(f"Step 1 (doc grouping): {step1_time:.3f}s for {len(docs_info)} docs")
         
-        # Build Doc symbols with merged path trees
+        # Step 2: For each doc, batch fetch all symbols and relationships
         doc_symbols = []
-        for doc_id, data in doc_data.items():
-            doc_info = data['doc_info']
-            paths = data['paths']
-
+        step2_start = time.perf_counter()
+        
+        for doc_info in docs_info:
+            doc_id = doc_info['doc_id']
+            matched_ids = doc_info['matched_ids']
+            
+            # Fetch all symbols in this doc with parent-child relationships
+            symbols_result = self.conn.execute("""
+                MATCH (d:Doc {id: $doc_id})-[:PART_OF]->(s:Symbol)
+                OPTIONAL MATCH (s)-[:PARENT_OF]->(child:Symbol)
+                RETURN s.id, s.name, s.kind, s.start_line, s.start_char, s.end_line, s.end_char, s.body, s.overload_idx,
+                       COLLECT(DISTINCT child.id) AS child_ids
+                ORDER BY s.start_line
+            """, {"doc_id": doc_id})
+            
+            # Build symbol lookup and parent-child map
+            symbol_map = {}
+            children_map = {}
+            root_ids = set()
+            
+            while symbols_result.has_next():
+                row = symbols_result.get_next()
+                symbol_id = row[0]
+                child_ids_raw = row[9] if row[9] is not None else []
+                child_ids = [cid for cid in child_ids_raw if cid]  # Filter out None values
+                
+                symbol_map[symbol_id] = {
+                    'id': symbol_id,
+                    'name': row[1],
+                    'kind': row[2],
+                    'range': {
+                        'start': {'line': row[3], 'character': row[4]},
+                        'end': {'line': row[5], 'character': row[6]}
+                    },
+                    'selectionRange': {
+                        'start': {'line': row[3], 'character': row[4]},
+                        'end': {'line': row[5], 'character': row[6]}
+                    },
+                    'location': {
+                        'range': {
+                            'start': {'line': row[3], 'character': row[4]},
+                            'end': {'line': row[5], 'character': row[6]}
+                        }
+                    },
+                    'body': row[7],
+                    'overload_idx': row[8],
+                    'children': []
+                }
+                
+                children_map[symbol_id] = child_ids
+                
+                # Track root symbols (will be determined after building children_map)
+                root_ids.add(symbol_id)
+            
+            # Remove non-root symbols from root_ids
+            for parent_id, child_id_list in children_map.items():
+                for child_id in child_id_list:
+                    root_ids.discard(child_id)
+            
+            # Build tree recursively from roots, filtering to matched symbols
+            def build_tree_filtered(sid: str) -> Optional[Dict[str, Any]]:
+                symbol = symbol_map[sid].copy()
+                child_ids = children_map.get(sid, [])
+                
+                # Recursively build children
+                filtered_children = []
+                for cid in child_ids:
+                    if cid in symbol_map:
+                        child_tree = build_tree_filtered(cid)
+                        if child_tree:
+                            filtered_children.append(child_tree)
+                
+                # Include this symbol if it's matched or has matched descendants
+                if sid in matched_ids or filtered_children:
+                    symbol['children'] = filtered_children
+                    return symbol
+                
+                return None
+            
+            # Build filtered trees for all roots
+            filtered_roots = []
+            for root_id in sorted(root_ids):
+                if root_id in symbol_map:
+                    tree = build_tree_filtered(root_id)
+                    if tree:
+                        filtered_roots.append(tree)
+            
             # Create Doc symbol
             doc_symbol = {
                 'id': doc_id,
-                'name': doc_info['name'],
+                'name': doc_info['doc_name'],
                 'kind': 1,  # File kind
-                'relativePath': doc_info['relative_path'],
-                'contentHash': doc_info.get('content_hash', ''),
-                'children': []
+                'relativePath': doc_info['doc_path'],
+                'contentHash': doc_info['doc_hash'],
+                'children': filtered_roots
             }
-            
-            # Merge all paths into a single tree structure
-            merged_tree = self._merge_paths_to_tree(paths, node_cache)
-            doc_symbol['children'] = merged_tree
             doc_symbols.append(doc_symbol)
+        
+        step2_time = time.perf_counter() - step2_start
+        total_time = time.perf_counter() - start
+        log.debug(f"Step 2 (tree building): {step2_time:.3f}s, total: {total_time:.3f}s")
         
         return doc_symbols
     
@@ -886,7 +902,7 @@ class KuzuSymbolCache:
         
         # Recursively build tree
         def build_tree(symbol_id: str) -> Dict[str, Any]:
-            symbol = node_cache[symbol_id]
+            symbol = node_cache[symbol_id].copy()
             
             # Get children and recursively build their trees
             child_ids = children_map.get(symbol_id, set())
@@ -944,27 +960,6 @@ class KuzuSymbolCache:
         
         symbol['children'] = children
         return symbol
-    
-    def _build_symbol_tree_no_children(self, symbol_id: str) -> Optional[Dict[str, Any]]:
-        """Build symbol without children (used for building parent chain)."""
-        symbol = self._get_symbol_by_id(symbol_id)
-        if not symbol:
-            return None
-        
-        # Query parent from database
-        parent_result = self.conn.execute(f"""
-            MATCH (p:Symbol)-[:PARENT_OF]->(s:Symbol {{id: '{symbol_id}'}})
-            RETURN p.id
-        """)
-        if parent_result.has_next():
-            parent_id = parent_result.get_next()[0]
-            symbol['parent'] = self._build_symbol_tree_no_children(parent_id)
-        else:
-            symbol['parent'] = None
-        
-        symbol['children'] = []
-        return symbol
-            
       
     
     def _get_symbol_by_id(self, symbol_id: str) -> Optional[Dict[str, Any]]:
@@ -1012,16 +1007,4 @@ class KuzuSymbolCache:
         except Exception as e:
             log.debug(f"Error during cleanup: {e}")
 
-    def clear_dir(self):
-        """Clear all symbols under a specific directory."""
-        with self._lock:
-            if self.db:
-                raise ValueError("Cannot clear database directory while database is active. Please close the connection first.")
-            else:
-                db_path = self.base_dir / self.db_name
-                wall_path = db_path.with_suffix('.wal')
-                if wall_path.exists():
-                    wall_path.unlink()
-                if db_path.exists():
-                    db_path.unlink()
 

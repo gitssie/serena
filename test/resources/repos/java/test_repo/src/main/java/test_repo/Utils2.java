@@ -1,15 +1,11 @@
 package test_repo;
 
-public class Utils {
+public class Utils2 {
     public static void printHello() {
         System.out.println("Hello from Utils!");
     }
 	
-	/**
-	* pint hello to System Out
-	* @param name the name
-	**/
 	public static void printHello(String name) {
-        System.out.println("Hello "+name+" from Jack!!asdasd");
+        System.out.println("Hello "+name+" from dasd");
     }
 }

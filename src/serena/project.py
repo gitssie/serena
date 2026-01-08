@@ -1,11 +1,14 @@
+import collections
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
+import click
 import pathspec
-from sensai.util.string import ToStringMixin
+from sensai.util.string import ToStringMixin ,dict_string
+from tqdm import tqdm
 
 from serena.config.serena_config import DEFAULT_TOOL_TIMEOUT, ProjectConfig, get_serena_managed_in_project_dir
 from serena.constants import SERENA_FILE_ENCODING, SERENA_MANAGED_DIR_NAME
@@ -16,6 +19,7 @@ from serena.util.general import save_yaml
 from solidlsp import SolidLanguageServer
 from solidlsp.ls_config import Language
 from solidlsp.ls_utils import FileUtils
+from solidlsp.index import SymbolAppender
 
 log = logging.getLogger(__name__)
 
@@ -365,8 +369,7 @@ class Project(ToStringMixin):
         log_level: int = logging.INFO,
         ls_timeout: float | None = DEFAULT_TOOL_TIMEOUT - 5,
         trace_lsp_communication: bool = False,
-        ls_specific_settings: dict[Language, Any] | None = None,
-        rebuild_indexes: bool = False,
+        ls_specific_settings: dict[Language, Any] | None = None
     ) -> LanguageServerManager:
         """
         Creates the language server manager for the project, starting one language server per configured programming language.
@@ -393,7 +396,7 @@ class Project(ToStringMixin):
             ls_specific_settings=ls_specific_settings,
             trace_lsp_communication=trace_lsp_communication,
         )
-        self.language_server_manager = LanguageServerManager.from_languages(self.project_config.languages, factory, rebuild_indexes=rebuild_indexes)
+        self.language_server_manager = LanguageServerManager.from_languages(self.project_config.languages, factory)
         return self.language_server_manager
 
     def add_language(self, language: Language) -> None:
@@ -445,3 +448,54 @@ class Project(ToStringMixin):
         if self.language_server_manager is not None:
             self.language_server_manager.stop_all(save_cache=True, timeout=timeout)
             self.language_server_manager = None
+
+    def iter_language_servers(self) -> Iterator[SolidLanguageServer]:
+        if self.language_server_manager is None:
+            return
+        for ls in self.language_server_manager.iter_language_servers():
+            yield ls
+
+    def init_index_cache(self, clear_data: bool = False, batch_mode: bool = False) -> dict[Language, SymbolAppender]:
+        """
+        Initialize index cache for all language servers.
+        
+        :param clear_data: If True, clears all existing cache data
+        :param batch_mode: If True, returns batch appenders; otherwise returns single appenders
+        :return: dict mapping Language to SymbolAppender for each language server
+        """
+        appenders = {}
+        if self.language_server_manager is None:
+            return appenders
+        for ls in self.language_server_manager.iter_language_servers():
+            appender = ls.init_index_cache(clear_data, batch_mode=batch_mode)
+            appenders[ls.language] = appender
+        return appenders
+
+    def build_indexs(self) -> None:
+        if self.language_server_manager is None:
+            return
+        ls_mgr = self.language_server_manager
+
+        files = self.gather_source_files()
+        appender = self.init_index_cache(batch_mode=True)
+
+        collected_exceptions: list[Exception] = []
+        files_failed = []
+        language_file_counts: dict[Language, int] = collections.defaultdict(lambda: 0)
+        for i, f in enumerate(tqdm(files, desc="Indexing")):
+            try:
+                ls = ls_mgr.get_language_server(f)
+                ls.build_index(f, appender=appender.get(ls.language))
+                language_file_counts[ls.language] += 1
+            except Exception as e:
+                log.error(f"Failed to index {f}, {e}, continuing.")
+                collected_exceptions.append(e)
+                files_failed.append(f)
+            if (i + 1) % 10 == 0:
+                ls_mgr.save_all_caches()
+        
+        for app in appender.values():
+            app.commit()
+        
+        reported_language_file_counts = {k.value: v for k, v in language_file_counts.items()}
+        click.echo(f"Indexed files per language: {dict_string(reported_language_file_counts, brackets=None)}")

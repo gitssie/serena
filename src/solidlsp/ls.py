@@ -44,9 +44,8 @@ from solidlsp.lsp_protocol_handler.server import (
     StringDict,
 )
 from solidlsp.settings import SolidLSPSettings
-from solidlsp.util.cache import load_cache, save_cache
-from solidlsp.util.kuzu_symbol_cache import KuzuSymbolCache
-
+from solidlsp.index import SymbolIndex,SymbolAppender, create_symbol_index
+        
 GenericDocumentSymbol = Union[LSPTypes.DocumentSymbol, LSPTypes.SymbolInformation, ls_types.UnifiedSymbolInformation]
 log = logging.getLogger(__name__)
 
@@ -84,7 +83,7 @@ class LSPFileBuffer:
     content_hash: str = ""
 
     def __post_init__(self) -> None:
-        self.content_hash = hashlib.md5(self.contents.encode("utf-8")).hexdigest()
+        self.content_hash = hashlib.blake2b(self.contents.encode("utf-8"), digest_size=16).hexdigest()
 
     def split_lines(self) -> list[str]:
         """Splits the contents of the file into lines."""
@@ -245,8 +244,7 @@ class SolidLanguageServer(ABC):
         repository_root_path: str,
         process_launch_info: ProcessLaunchInfo,
         language_id: str,
-        solidlsp_settings: SolidLSPSettings,
-        cache_version_raw_document_symbols: Hashable = 1,
+        solidlsp_settings: SolidLSPSettings
     ):
         """
         Initializes a LanguageServer instance.
@@ -279,17 +277,23 @@ class SolidLanguageServer(ABC):
 
         # initialise symbol caches
         self.cache_dir = (
-            Path(self.repository_root_path) / self._solidlsp_settings.project_data_relative_path / self.CACHE_FOLDER_NAME / self.language_id
+            Path(self.repository_root_path) / self._solidlsp_settings.project_data_relative_path / self.CACHE_FOLDER_NAME
         )
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-        # Initialize Kùzu-based symbol cache (required)
+        # Initialize symbol index (using factory method)
+        backend = self._custom_settings.get("symbol_index_backend", "duckdb")
         try:
-            self.kuzu_cache = KuzuSymbolCache(str(self.cache_dir / "kuzu"))
-            log.info(f"Using Kùzu graph database for symbol caching for {language_id}")
+            self.symbol_index: SymbolIndex = create_symbol_index(
+                base_dir=str(self.cache_dir),
+                language_id=self.language_id,
+                backend=backend,
+                db_name="symbol_db"
+            )
+            log.info(f"Initialized {backend} symbol index for {language_id}")
         except ImportError as e:
             raise ValueError(
-                "Kùzu is required for symbol caching. Install it with: pip install kuzu"
+                f"Failed to initialize symbol index with backend '{backend}': {e}"
             ) from e
 
         self.server_started = False
@@ -466,8 +470,8 @@ class SolidLanguageServer(ABC):
             log.error(f"Error during process shutdown: {e}")
 
     @contextmanager
-    def start_server(self, rebuild_indexes: bool=False) -> Iterator["SolidLanguageServer"]:
-        self.start(rebuild_indexes=rebuild_indexes)
+    def start_server(self) -> Iterator["SolidLanguageServer"]:
+        self.start()
         yield self
         self.stop()
 
@@ -488,7 +492,7 @@ class SolidLanguageServer(ABC):
         return self.language_id
 
     @contextmanager
-    def open_file(self, relative_file_path: str) -> Iterator[LSPFileBuffer]:
+    def open_file(self, relative_file_path: str, file_buffer: LSPFileBuffer | None = None) -> Iterator[LSPFileBuffer]:
         """
         Open a file in the Language Server. This is required before making any requests to the Language Server.
 
@@ -509,19 +513,23 @@ class SolidLanguageServer(ABC):
             yield self.open_file_buffers[uri]
             self.open_file_buffers[uri].ref_count -= 1
         else:
-            contents = FileUtils.read_file(absolute_file_path, self._encoding)
+            if file_buffer is None or file_buffer.ref_count > 0:
+                contents = FileUtils.read_file(absolute_file_path, self._encoding)
+                version = 0
+                language_id = self._get_language_id_for_file(relative_file_path)
+                file_buffer = LSPFileBuffer(uri, contents, version, language_id, 1)
+            else:
+                file_buffer.ref_count = 1
 
-            version = 0
-            language_id = self._get_language_id_for_file(relative_file_path)
-            self.open_file_buffers[uri] = LSPFileBuffer(uri, contents, version, language_id, 1)
+            self.open_file_buffers[uri] = file_buffer
 
             self.server.notify.did_open_text_document(
                 {
                     LSPConstants.TEXT_DOCUMENT: {  # type: ignore
                         LSPConstants.URI: uri,
-                        LSPConstants.LANGUAGE_ID: language_id,
+                        LSPConstants.LANGUAGE_ID:file_buffer.language_id,
                         LSPConstants.VERSION: 0,
-                        LSPConstants.TEXT: contents,
+                        LSPConstants.TEXT: file_buffer.contents,
                     }
                 }
             )
@@ -549,7 +557,7 @@ class SolidLanguageServer(ABC):
         if file_buffer is not None and file_buffer.ref_count >= 1:
             yield file_buffer
         else:
-            with self.open_file(relative_file_path) as fb:
+            with self.open_file(relative_file_path, file_buffer) as fb:
                 yield fb
 
     def insert_text_at_position(self, relative_file_path: str, line: int, column: int, text_to_be_inserted: str) -> ls_types.Position:
@@ -1110,31 +1118,7 @@ class SolidLanguageServer(ABC):
             with self.open_file(relative_file_path) as opened_file_data:
                 return get_raw_document_symbols(opened_file_data)
 
-    def request_document_symbols(self, relative_file_path: str, file_buffer: LSPFileBuffer | None = None,ignore_cache: bool = False) -> DocumentSymbols:
-        """
-        Retrieves the collection of symbols in the given file
-
-        :param relative_file_path: The relative path of the file that has the symbols
-        :param file_buffer: an optional file buffer if the file is already opened.
-        :return: the collection of symbols in the file.
-            All contained symbols will have a location, children, and a parent attribute,
-            where the parent attribute is None for root symbols.
-            Note that this is slightly different from the call to request_full_symbol_tree,
-            where the parent attribute will be the file symbol which in turn may have a package symbol as parent.
-            If you need a symbol tree that contains file symbols as well, you should use `request_full_symbol_tree` instead.
-        """
-        if not ignore_cache:
-            if file_buffer is None:
-                file_buffer = self.read_file(relative_file_path)
-            
-            # Try Kùzu cache
-            cached = self.kuzu_cache.get_doc_symbols(relative_file_path, file_buffer.content_hash)
-            if cached is not None:
-                log.debug("Returning cached document symbols for %s from Kùzu", relative_file_path)
-                file_symbol = cached['file_symbol']
-                all_unified_symbols = self._convert_file_symbol_children_to_unified([file_symbol])
-                return DocumentSymbols(all_unified_symbols)
-        
+    def _request_unified_document_symbols(self, relative_file_path: str, file_buffer: LSPFileBuffer | None = None) -> DocumentSymbols:
         with self._open_file_context(relative_file_path, file_buffer) as file_data:
             # no cached result: request the root symbols from the language server
             root_symbols = self._request_document_symbols(relative_file_path, file_data)
@@ -1154,26 +1138,48 @@ class SolidLanguageServer(ABC):
 
             unified_root_symbols = self._convert_symbols_with_common_parent(root_symbols, None, relative_file_path, file_lines)
             document_symbols = DocumentSymbols(unified_root_symbols)
-
-            # Store in Kùzu cache
-            log.debug("Updating cached document symbols for %s", relative_file_path)
-            try:
-                self.kuzu_cache.store_doc_symbols(
-                    relative_file_path,
-                    file_data.content_hash,
-                    unified_root_symbols
-                )
-            except Exception as e:
-                log.error(f"Failed to store symbols in Kùzu cache for {relative_file_path}: {e}")
-
             return document_symbols
+    
+    
+    def request_document_symbols(self, relative_file_path: str, file_buffer: LSPFileBuffer | None = None) -> DocumentSymbols:
+        """
+        Retrieves the collection of symbols in the given file
 
-    def request_full_symbol_tree(
-        self, 
-        within_relative_path: str | None = None,
-        symbol_filter: Callable[[ls_types.UnifiedSymbolInformation], bool] | None = None,
-        file_filter: Callable[[str], bool] | None = None
-    ) -> list[ls_types.UnifiedSymbolInformation]:
+        :param relative_file_path: The relative path of the file that has the symbols
+        :param file_buffer: an optional file buffer if the file is already opened.
+        :return: the collection of symbols in the file.
+            All contained symbols will have a location, children, and a parent attribute,
+            where the parent attribute is None for root symbols.
+            Note that this is slightly different from the call to request_full_symbol_tree,
+            where the parent attribute will be the file symbol which in turn may have a package symbol as parent.
+            If you need a symbol tree that contains file symbols as well, you should use `request_full_symbol_tree` instead.
+        """
+        if file_buffer is None:
+            file_buffer = self.read_file(relative_file_path)
+            # Try symbol index cache
+        cached = self.symbol_index.get_doc_symbols(relative_file_path, file_buffer.content_hash)
+        if cached is not None:
+            log.debug("Returning cached document symbols for %s from symbol index", relative_file_path)
+            file_symbol = cached['file_symbol']
+            all_unified_symbols = self._convert_file_symbol_children_to_unified([file_symbol])
+            return DocumentSymbols(all_unified_symbols)
+        
+        document_symbols = self._request_unified_document_symbols(relative_file_path, file_buffer)
+        
+        #Store in symbol index cache
+        log.debug("Updating cached document symbols for %s", relative_file_path)
+        try:
+            self.symbol_index.store_doc_symbols(
+                relative_file_path,
+                file_buffer.content_hash,
+                document_symbols.root_symbols
+            )
+        except Exception as e:
+            log.error(f"Failed to store symbols in symbol index cache for {relative_file_path}: {e}")
+
+        return document_symbols
+
+    def request_full_symbol_tree(self, within_relative_path: str | None = None) -> list[ls_types.UnifiedSymbolInformation]:
         """
         Will go through all files in the project or within a relative path and build a tree of symbols.
         Note: this may be slow the first time it is called, especially if `within_relative_path` is not used to restrict the search.
@@ -1184,19 +1190,10 @@ class SolidLanguageServer(ABC):
         All symbols except the root packages will have a parent attribute.
         Will ignore directories starting with '.', language-specific defaults
         and user-configured directories (e.g. from .gitignore).
-        
-        PERFORMANCE NOTE: This method now attempts to use Kùzu cache when possible to avoid
-        redundant file parsing. Symbol and file filters are still applied for precise results.
 
         :param within_relative_path: pass a relative path to only consider symbols within this path.
             If a file is passed, only the symbols within this file will be considered.
             If a directory is passed, all files within this directory will be considered.
-        :param symbol_filter: an optional callable to filter symbols. If provided, only symbols (and their descendants)
-            for which the filter returns True will be included. This filtering happens early, avoiding unnecessary
-            file symbol creation and improving performance.
-        :param file_filter: an optional callable to determine whether a file should be processed at all.
-            Receives the relative file path. If it returns False, the file is skipped entirely (no document symbols requested).
-            This is more efficient than symbol_filter for filtering at the file level.
         :return: A list of root symbols representing the top-level packages/modules in the project.
         """
         if within_relative_path is not None:
@@ -1263,37 +1260,15 @@ class SolidLanguageServer(ABC):
                     continue
 
                 if os.path.isdir(contained_dir_or_file_abs_path):
-                    # Apply file filter to directories to skip entire subdirectories
-                    if file_filter is not None and not file_filter(contained_dir_or_file_rel_path):
-                        log.debug("Skipping directory: %s (filtered by file_filter)", contained_dir_or_file_rel_path)
-                        continue
-                    
                     child_symbols = process_directory(contained_dir_or_file_rel_path)
                     package_symbol["children"].extend(child_symbols)
                     for child in child_symbols:
                         child["parent"] = package_symbol
 
                 elif os.path.isfile(contained_dir_or_file_abs_path):
-                    # Apply file filter early to skip processing entirely
-                    if file_filter is not None and not file_filter(contained_dir_or_file_rel_path):
-                        log.debug("Skipping file: %s (filtered by file_filter)", contained_dir_or_file_rel_path)
-                        continue
-                    
                     with self._open_file_context(contained_dir_or_file_rel_path) as file_data:
                         document_symbols = self.request_document_symbols(contained_dir_or_file_rel_path, file_data)
                         file_root_nodes = document_symbols.root_symbols
-
-                        # Apply symbol filter early to avoid creating unnecessary file_symbol
-                        if symbol_filter is not None:
-                            filtered_nodes = []
-                            for node in file_root_nodes:
-                                if symbol_filter(node):
-                                    filtered_nodes.append(node)
-                            file_root_nodes = filtered_nodes
-                            
-                            # Skip creating file symbol if all children were filtered out
-                            if not file_root_nodes:
-                                continue
 
                         # Create file symbol, link with children
                         file_range = self._get_range_from_file_content(file_data.contents)
@@ -1351,14 +1326,14 @@ class SolidLanguageServer(ABC):
 
     def request_dir_overview(self, relative_dir_path: str) -> dict[str, list[UnifiedSymbolInformation]]:
         """
-        Get an overview of all symbols in a directory using Kùzu cache query.
+        Get an overview of all symbols in a directory using symbol index cache query.
         
         :param relative_dir_path: The relative path to the directory
         :return: A mapping of all relative paths analyzed to lists of top-level symbols in the corresponding file.
         """
-        # Use Kùzu cache to query all symbols in the directory
+        # Use symbol index cache to query all symbols in the directory
         # Use empty pattern to match all symbols
-        file_symbols = self.kuzu_cache.query_symbols(
+        file_symbols = self.symbol_index.query_symbols(
             name_path_pattern="",
             substring_matching=False,
             include_kinds=None,
@@ -1397,7 +1372,7 @@ class SolidLanguageServer(ABC):
         Filter file symbols based on file existence and content hash.
         Updates symbols for modified files using request_document_symbols.
         
-        :param file_symbols: List of file symbol dictionaries from kuzu cache
+        :param file_symbols: List of file symbol dictionaries from symbol index
         :return: Filtered and updated list of file symbols
         """
         filtered_symbols = []
@@ -1425,7 +1400,7 @@ class SolidLanguageServer(ABC):
                 if cached_content_hash and current_hash != cached_content_hash:
                     log.debug(f"File modified (hash mismatch), updating symbols: {relative_path}")
                     # Get fresh document symbols
-                    doc_symbols = self.request_document_symbols(relative_path, file_buffer, True)
+                    doc_symbols = self.request_document_symbols(relative_path, file_buffer)
                     
                     # Update file symbol with fresh data
                     file_symbol['contentHash'] = current_hash
@@ -1477,14 +1452,14 @@ class SolidLanguageServer(ABC):
                     root_nodes = self.request_document_symbols(within_relative_path).root_symbols
                     return root_nodes
         
-        # For directories or no path specified, use Kùzu query if available
-        log.debug(f"Using Kùzu query for pattern '{name_path_pattern}'")
+        # For directories or no path specified, use symbol index query if available
+        log.debug(f"Using symbol index query for pattern '{name_path_pattern}'")
 
         # Convert SymbolKind to int for internal use
         include_kinds_int = [k.value if isinstance(k, SymbolKind) else k for k in include_kinds] if include_kinds else None
         exclude_kinds_int = [k.value if isinstance(k, SymbolKind) else k for k in exclude_kinds] if exclude_kinds else None
 
-        file_symbols = self.kuzu_cache.query_symbols(
+        file_symbols = self.symbol_index.query_symbols(
             name_path_pattern=name_path_pattern,
             substring_matching=substring_matching,
             include_kinds=include_kinds_int,
@@ -1985,7 +1960,7 @@ class SolidLanguageServer(ABC):
                 self.delete_text_between_positions(relative_path, start_pos, end_pos)
                 self.insert_text_at_position(relative_path, start_pos["line"], start_pos["character"], edit["newText"])
 
-    def start(self, rebuild_indexes: bool=False) -> "SolidLanguageServer":
+    def start(self) -> "SolidLanguageServer":
         """
         Starts the language server process and connects to it. Call shutdown when ready.
 
@@ -1993,12 +1968,12 @@ class SolidLanguageServer(ABC):
         """
         log.info(f"Starting language server with language {self.language_server.language} for {self.language_server.repository_root_path}")
         self._start_server_process()
-        self.build_index(rebuild_indexes=rebuild_indexes)
+        self.symbol_index.start()
         return self
 
     def stop(self, shutdown_timeout: float = 2.0) -> None:
         """
-        Stops the language server process.
+        Stops the language server process and symbol index cache.
         This function never raises an exception (any exceptions during shutdown are logged).
 
         :param shutdown_timeout: time, in seconds, to wait for the server to shutdown gracefully before killing it
@@ -2007,6 +1982,10 @@ class SolidLanguageServer(ABC):
             self._shutdown(timeout=shutdown_timeout)
         except Exception as e:
             log.warning(f"Exception while shutting down language server: {e}")
+        
+        # Stop symbol index cache
+        if self.symbol_index.is_started():
+            self.symbol_index.stop()
 
     @property
     def language_server(self) -> Self:
@@ -2033,115 +2012,54 @@ class SolidLanguageServer(ABC):
         absolute_path = str(PurePath(self.repository_root_path, relative_path))
         uri = pathlib.Path(absolute_path).as_uri()
         contents = FileUtils.read_file(absolute_path, self._encoding)
-        return LSPFileBuffer(uri, contents, 0, self.language_id, 0)
+        language_id = self._get_language_id_for_file(relative_path)
+        return LSPFileBuffer(uri, contents, 0, language_id, 0)
 
-    def _index_single_file(self,rel_file_path: str) -> tuple[str, bool, str | None]:
+    def init_index_cache(self, clear_data: bool = False, batch_mode: bool = False) -> SymbolAppender:
+        """
+        Initialize the index cache by starting the symbol index database connection.
+        
+        :param clear_data: If True, clears all existing data in the cache
+        :param batch_mode: If True, returns a batch appender; otherwise returns a single appender
+        :return: SymbolAppender for indexing operations (always returns an appender)
+        """
+        # Start cache if not already started
+        if not self.symbol_index.is_started():
+            self.symbol_index.start()
+        
+        # Clear data if requested (works whether started or not)
+        if clear_data:
+            self.symbol_index.clear_all()
+        
+        # Return appropriate appender based on batch_mode
+        return self.symbol_index.create_appender(batch_mode=batch_mode)
+
+    def build_index(self, rel_file_path: str, appender: SymbolAppender, rebuild: bool = False) -> bool:
         """
         Index a single file by requesting its document symbols.
         
-        :param abs_file_path: The absolute path of the file to index
         :param rel_file_path: The relative path of the file to index
-        :return: Tuple of (file_path, success, error_message)
+        :param appender: SymbolAppender for storing symbols (required)
+        :param rebuild: If True, forces re-indexing even if cached
+        :return: True if indexing succeeded, False otherwise
         """
-        try:
-            # Directly read file content without notifying LSP
-            file_buffer = self.read_file(rel_file_path)
-            # Check if already cached and valid
-            if self.kuzu_cache.is_doc_cached(rel_file_path, file_buffer.content_hash):
-                return (rel_file_path, True, None)
-            
-            # Not cached or outdated, need to index with LSP
-            self.request_document_symbols(rel_file_path,file_buffer,True)
-            
-            return (rel_file_path, True, None)
-        except Exception as e:
-            return (rel_file_path, False, str(e))
-    
-    def build_index(self, rebuild_indexes: bool=False, max_workers: int = 4) -> None:
-        """
-        Build the symbol index for the language server.
-        Traverses all files in the project and requests document symbols to populate the cache.
-        Uses multi-threading to process files within each directory in parallel.
+        if not self.symbol_index.is_started():
+            raise SolidLSPException("Symbol index cache is not started. Call init_index_cache() before building index.")
         
-        :param rebuild_indexes: Whether to clear the existing cache before rebuilding
-        :param max_workers: Maximum number of threads to use for parallel processing (default: 4)
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # Directly read file content without notifying LSP
+        file_buffer = self.read_file(rel_file_path)
         
-        if rebuild_indexes:
-            self.kuzu_cache.clear_dir()
-        self.kuzu_cache.start()
+        # Check if already cached and valid (skip if rebuild is forced)
+        if not rebuild and self.symbol_index.is_doc_cached(rel_file_path, file_buffer.content_hash):
+            log.debug(f"File {rel_file_path} already cached, skipping")
+            return True
         
-        total_files = 0
-        total_errors = 0
+        log.debug(f"Indexing file {rel_file_path}")
         
-        # Create a shared thread pool for the entire indexing process
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Helper function to recursively traverse directories and index files
-            def traverse_and_index(rel_dir_path: str) -> None:
-                nonlocal total_files, total_errors
-                
-                abs_dir_path = self.repository_root_path if rel_dir_path == "." else os.path.join(self.repository_root_path, rel_dir_path)
-                abs_dir_path = os.path.realpath(abs_dir_path)
-                
-                if self.is_ignored_path(str(Path(abs_dir_path).relative_to(self.repository_root_path))):
-                    log.debug("Skipping directory during indexing: %s (because it should be ignored)", rel_dir_path)
-                    return
-                
-                try:
-                    contained_items = os.listdir(abs_dir_path)
-                except OSError:
-                    return
-                
-                # Quick filter: skip empty directories
-                if not contained_items:
-                    return
-                
-                # Separate files and subdirectories
-                files_in_dir = []
-                subdirs = []
-                
-                for item_name in contained_items:
-                    item_abs_path = os.path.join(abs_dir_path, item_name)
-                    
-                    # Get relative path
-                    try:
-                        item_rel_path = str(Path(item_abs_path).resolve().relative_to(self.repository_root_path))
-                    except ValueError as e:
-                        log.warning("Skipping path %s during indexing; likely outside of repository root [cause: %s]", item_abs_path, e)
-                        continue
-                    
-                    if self.is_ignored_path(item_rel_path):
-                        continue
-                    
-                    if os.path.isdir(item_abs_path):
-                        subdirs.append(item_rel_path)
-                    elif os.path.isfile(item_abs_path):
-                        files_in_dir.append(item_rel_path)
-                
-                # Process files in current directory using shared thread pool
-                if files_in_dir:
-                    futures = {
-                        executor.submit(self._index_single_file, rel_path): rel_path
-                        for rel_path in files_in_dir
-                    }
-                    
-                    dir_errors = 0
-                    for future in as_completed(futures):
-                        file_path, success, error = future.result()
-                        if success:
-                            total_files += 1
-                        else:
-                            total_errors += 1
-                            dir_errors += 1
-                            log.warning("Failed to index file %s: %s", file_path, error)
-                
-                # Recursively process subdirectories
-                for subdir in subdirs:
-                    traverse_and_index(subdir)
-            
-            # Start traversal from repository root
-            log.info("Starting index build with %d worker threads", max_workers)
-            traverse_and_index(".")
+        # Request symbols from LSP
+        doc_symbols = self._request_unified_document_symbols(rel_file_path, file_buffer)
         
-        log.info("Documents index build complete: %d files indexed, %d errors", total_files, total_errors)
+        # Append symbols
+        appender.append(rel_file_path, file_buffer.content_hash, doc_symbols.root_symbols)
+        
+        return True

@@ -586,10 +586,12 @@ class ProjectCommands(AutoRegisteringGroup):
         proj = Project.load(os.path.abspath(project))
         click.echo(f"Indexing symbols in project {project} …")
         ls_mgr = proj.create_language_server_manager(
-            log_level=lvl, ls_timeout=timeout, ls_specific_settings=serena_config.ls_specific_settings,rebuild_indexes=True
+            log_level=lvl, ls_timeout=timeout, ls_specific_settings=serena_config.ls_specific_settings
         )
         try:
             log_file = os.path.join(project, ".serena", "logs", "indexing.txt")
+
+            appender = proj.init_index_cache(clear_data=True,batch_mode=True)
 
             files = proj.gather_source_files()
 
@@ -599,7 +601,7 @@ class ProjectCommands(AutoRegisteringGroup):
             for i, f in enumerate(tqdm(files, desc="Indexing")):
                 try:
                     ls = ls_mgr.get_language_server(f)
-                    ls.request_document_symbols(f)
+                    ls.build_index(f, appender=appender[ls.language], rebuild=True)
                     language_file_counts[ls.language] += 1
                 except Exception as e:
                     log.error(f"Failed to index {f}, {e}, continuing.")
@@ -607,6 +609,10 @@ class ProjectCommands(AutoRegisteringGroup):
                     files_failed.append(f)
                 if (i + 1) % 10 == 0:
                     ls_mgr.save_all_caches()
+            
+            for app in appender.values():
+                app.commit()
+
             reported_language_file_counts = {k.value: v for k, v in language_file_counts.items()}
             click.echo(f"Indexed files per language: {dict_string(reported_language_file_counts, brackets=None)}")
             ls_mgr.save_all_caches()

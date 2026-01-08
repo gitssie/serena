@@ -330,7 +330,7 @@ class VueLanguageServer(SolidLanguageServer):
             return []
 
     @override
-    def request_references(self, relative_file_path: str, line: int, column: int) -> list[ls_types.Location]:
+    def request_references(self, relative_file_path: str, line: int, column: int, max_matches: int = 50) -> list[ls_types.Location]:
         if not self.server_started:
             log.error("request_references called before Language Server started")
             raise SolidLSPException("Language Server not started")

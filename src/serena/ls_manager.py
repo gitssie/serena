@@ -75,13 +75,13 @@ class LanguageServerManager:
         self._default_language_server = next(iter(language_servers.values()))
         self._root_path = self._default_language_server.repository_root_path
         self._file_watch_manager = None
-        
+        enable_auto_caching = False
         # 自动启动文件监听
         if enable_auto_caching:
             self.enable_auto_caching()
 
     @staticmethod
-    def from_languages(languages: list[Language], factory: LanguageServerFactory, rebuild_indexes: bool=False) -> "LanguageServerManager":
+    def from_languages(languages: list[Language], factory: LanguageServerFactory) -> "LanguageServerManager":
         """
         Creates a manager with language servers for the given languages using the given factory.
         The language servers are started in parallel threads.
@@ -99,7 +99,7 @@ class LanguageServerManager:
             try:
                 with LogTime(f"Language server startup (language={language.value})"):
                     language_server = factory.create_language_server(language)
-                    language_server.start(rebuild_indexes=rebuild_indexes)
+                    language_server.start()
                     if not language_server.is_running():
                         raise RuntimeError(f"Failed to start the language server for language {language.value}")
                     with lock:
@@ -246,6 +246,3 @@ class LanguageServerManager:
     def is_auto_caching_enabled(self) -> bool:
         return self._file_watch_manager is not None and self._file_watch_manager.is_running()
     
-    def rebuild_indexes(self) -> None:
-        for ls in self.iter_language_servers():
-            ls.build_index(rebuild_indexes=True)

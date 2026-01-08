@@ -86,7 +86,7 @@ class Request(ToStringMixin):
 
     def get_result(self, timeout: float | None = None) -> Result:
         try:
-            return self._result_queue.get(timeout=100)
+            return self._result_queue.get(timeout=timeout)
         except Empty as e:
             if timeout is not None:
                 raise TimeoutError(f"Request timed out ({timeout=})") from e
