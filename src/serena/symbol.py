@@ -44,8 +44,8 @@ class LanguageServerSymbolLocation:
     """
 
     def __post_init__(self) -> None:
-        if self.relative_path is not None:
-            self.relative_path = self.relative_path.replace("/", os.path.sep)
+        # Keep forward slashes for consistent cross-platform path representation
+        pass
 
     def to_dict(self, include_relative_path: bool = True) -> dict[str, Any]:
         result = asdict(self)

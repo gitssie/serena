@@ -243,6 +243,15 @@ class EclipseJDTLS(SolidLanguageServer):
                             "code": item.get("code"),
                         }
                         ret.append(new_item)
+                    
+                    # If all diagnostics were filtered out, return success message
+                    if not ret:
+                        return [{
+                            "uri": uri,
+                            "severity": 3,  # Information
+                            "message": "Diagnostics check completed successfully - no issues found"
+                        }]
+                    
                     return ret
                 else:
                     log.warning(f"Timeout ({timeout}s) waiting for diagnostics for {relative_file_path}")
