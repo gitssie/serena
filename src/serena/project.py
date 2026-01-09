@@ -65,6 +65,7 @@ class Project(ToStringMixin):
         self.memories_manager = MemoriesManager(project_root)
         self.language_server_manager: LanguageServerManager | None = None
         self._is_newly_created = is_newly_created
+        self._file_watch_manager = None
 
         # create .gitignore file in the project's Serena data folder if not yet present
         serena_data_gitignore_path = os.path.join(self.path_to_serena_data_folder(), ".gitignore")
@@ -444,7 +445,21 @@ class Project(ToStringMixin):
             log.info("Removing and stopping the language server for language %s ...", language.value)
             self.language_server_manager.remove_language_server(language)
 
+    def startup(self) -> None:
+        """
+        Start up the project: build indexes and start file watch.
+        """
+        # Build indexes for all source files
+        self.build_indexs()
+        
+        # Start file watch for automatic caching
+        self.startWatch()
+    
     def shutdown(self, timeout: float = 2.0) -> None:
+        # Stop file watch manager first
+        if self._file_watch_manager is not None:
+            self.stopWatch()
+        
         if self.language_server_manager is not None:
             self.language_server_manager.stop_all(save_cache=True, timeout=timeout)
             self.language_server_manager = None
@@ -499,3 +514,39 @@ class Project(ToStringMixin):
         
         reported_language_file_counts = {k.value: v for k, v in language_file_counts.items()}
         click.echo(f"Indexed files per language: {dict_string(reported_language_file_counts, brackets=None)}")
+    
+    def startWatch(self) -> None:
+        """
+        Start file watch manager for automatic symbol caching on file changes.
+        """
+        if self._file_watch_manager is not None:
+            log.warning("File watch already started")
+            return
+        
+        if self.language_server_manager is None:
+            raise RuntimeError("Language server manager not initialized. Call init_language_servers() first.")
+        
+        from serena.file_watch_manager import FileWatchManager
+        self._file_watch_manager = FileWatchManager(self.project_root, self.language_server_manager)
+        self._file_watch_manager.start()
+        log.info(f"File watch started for {self.project_root}")
+    
+    def stopWatch(self) -> None:
+        """
+        Stop file watch manager.
+        """
+        if self._file_watch_manager is None:
+            log.warning("File watch not started")
+            return
+        
+        self._file_watch_manager.stop()
+        self._file_watch_manager = None
+        log.info(f"File watch stopped for {self.project_root}")
+    
+    def isWatchRunning(self) -> bool:
+        """
+        Check if file watch manager is running.
+        
+        :return: True if file watch is running, False otherwise
+        """
+        return self._file_watch_manager is not None and self._file_watch_manager.is_running()

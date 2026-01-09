@@ -2017,6 +2017,17 @@ class SolidLanguageServer(ABC):
         # Return appropriate appender based on batch_mode
         return self.symbol_index.create_appender(batch_mode=batch_mode)
 
+    def create_build_appender(self) -> SymbolAppender:
+        """
+        Create a SymbolAppender for bulk indexing operations.
+        
+        :return: SymbolAppender for bulk indexing
+        """
+        if not self.symbol_index.is_started():
+            raise SolidLSPException("Symbol index cache is not started. Call init_index_cache() before creating appender.")
+        
+        return self.symbol_index.create_appender(batch_mode=True)
+
     def build_index(self, rel_file_path: str, appender: SymbolAppender, rebuild: bool = False) -> bool:
         """
         Index a single file by requesting its document symbols.

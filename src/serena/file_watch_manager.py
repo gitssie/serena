@@ -26,18 +26,24 @@ class FileChangeHandler(FileSystemEventHandler):
     def on_created(self, event):
         if not event.is_directory:
             relative_path = os.path.relpath(event.src_path, self._root_path)
+            # Normalize path separators to forward slashes for consistent cross-platform handling
+            relative_path = relative_path.replace(os.path.sep, "/")
             if self._should_process_file(relative_path):
                 self._queue.put((relative_path, "created"))
     
     def on_modified(self, event):
         if not event.is_directory:
             relative_path = os.path.relpath(event.src_path, self._root_path)
+            # Normalize path separators to forward slashes for consistent cross-platform handling
+            relative_path = relative_path.replace(os.path.sep, "/")
             if self._should_process_file(relative_path):
                 self._queue.put((relative_path, "modified"))
     
     def on_deleted(self, event):
         if not event.is_directory:
             relative_path = os.path.relpath(event.src_path, self._root_path)
+            # Normalize path separators to forward slashes for consistent cross-platform handling
+            relative_path = relative_path.replace(os.path.sep, "/")
             if self._should_process_file(relative_path):
                 self._queue.put((relative_path, "deleted"))
 
@@ -123,28 +129,62 @@ class FileWatchManager:
     
     def _cache_worker(self):
         """
-        后台工作线程：从队列中取出文件变化事件并缓存符号
+        后台工作线程：从队列中取出文件变化事件并批量缓存符号
         """
+        # 批量处理的文件集合 - 按语言服务器分组（使用 set 去重）
+        batch_files: dict[SolidLanguageServer, set[str]] = {}
+        batch_timeout = 2.0  # 批量处理超时时间（秒）
+        
         while not self._stop_worker.is_set():
             try:
                 # 从队列获取文件变化事件（带超时）
-                relative_path, event_type = self._file_change_queue.get(timeout=1.0)
                 try:
+                    relative_path, event_type = self._file_change_queue.get(timeout=batch_timeout)
+                    
                     if event_type == "deleted":
-                        # 文件删除：从Kùzu缓存中删除文档符号
+                        # 文件删除：立即处理
                         self._delete_cached_symbols(relative_path)
                     else:
-                        # 文件创建或修改：获取LSP并缓存符号
+                        # 文件创建或修改：加入批处理队列（自动去重）
                         ls = self._get_language_server(relative_path)
                         if ls is not None:
-                            ls.request_document_symbols(relative_path)
+                            if ls not in batch_files:
+                                batch_files[ls] = set()
+                            batch_files[ls].add(relative_path)  # set 自动去重
                     
-                except Exception as e:
-                    log.error(f"❌ Failed to process {event_type} event for {relative_path}: {e}")
+                except queue.Empty:
+                    # 队列为空，继续等待
+                    pass
                 
-            except queue.Empty:
-                # 队列为空，继续等待
-                continue
+                # 批量处理条件：队列为空 且 有待处理文件
+                if self._file_change_queue.empty() and batch_files:
+                    for ls, files_set in batch_files.items():
+                        if not files_set:
+                            continue
+                        
+                        try:
+                            log.debug(f"Batch indexing {len(files_set)} unique files with {ls.__class__.__name__}")
+                            
+                            # 创建批量索引器
+                            appender = ls.create_build_appender()
+                            
+                            # 批量处理所有文件（已去重）
+                            for relative_path in files_set:
+                                try:
+                                    ls.build_index(relative_path, appender, rebuild=False)
+                                except Exception as e:
+                                    log.error(f"❌ Failed to index {relative_path}: {e}")
+                            
+                            # 提交批量索引
+                            appender.commit()
+                            log.debug(f"✅ Batch indexed {len(files_set)} files successfully")
+                            
+                        except Exception as e:
+                            log.error(f"❌ Failed to batch process files: {e}")
+                    
+                    # 清空批处理队列
+                    batch_files.clear()
+                
             except Exception as e:
                 log.error(f"Unexpected error in cache worker: {e}")
     

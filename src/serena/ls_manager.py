@@ -60,7 +60,6 @@ class LanguageServerManager:
         self,
         language_servers: dict[Language, SolidLanguageServer],
         language_server_factory: LanguageServerFactory | None = None,
-        enable_auto_caching: bool = True,
     ) -> None:
         """
         :param language_servers: a mapping from language to language server; the servers are assumed to be already started.
@@ -68,17 +67,11 @@ class LanguageServerManager:
             All servers are assumed to serve the same project root.
         :param language_server_factory: factory for language server creation; if None, dynamic (re)creation of language servers
             is not supported
-        :param enable_auto_caching: whether to enable automatic symbol caching on file changes
         """
         self._language_servers = language_servers
         self._language_server_factory = language_server_factory
         self._default_language_server = next(iter(language_servers.values()))
         self._root_path = self._default_language_server.repository_root_path
-        self._file_watch_manager = None
-        enable_auto_caching = False
-        # 自动启动文件监听
-        if enable_auto_caching:
-            self.enable_auto_caching()
 
     @staticmethod
     def from_languages(languages: list[Language], factory: LanguageServerFactory) -> "LanguageServerManager":
@@ -208,10 +201,6 @@ class LanguageServerManager:
         :param save_cache: whether to save the cache before stopping
         :param timeout: timeout for shutdown of each language server
         """
-        # 停止文件监听
-        if self._file_watch_manager is not None:
-            self.disable_auto_caching()
-        
         # 停止所有LSP
         for ls in self.iter_language_servers():
             self._stop_language_server(ls, save_cache=save_cache, timeout=timeout)
@@ -223,26 +212,4 @@ class LanguageServerManager:
         for ls in self.iter_language_servers():
             if ls.is_running():
                 ls.save_cache()
-
-    def enable_auto_caching(self) -> None:
-        if self._file_watch_manager is not None:
-            log.warning("Auto-caching already enabled")
-            return
-        
-        from serena.file_watch_manager import FileWatchManager
-        self._file_watch_manager = FileWatchManager(self._root_path, self)
-        self._file_watch_manager.start()
-        log.info(f"Auto-caching enabled for {self._root_path}")
-    
-    def disable_auto_caching(self) -> None:
-        if self._file_watch_manager is None:
-            log.warning("Auto-caching not enabled")
-            return
-        
-        self._file_watch_manager.stop()
-        self._file_watch_manager = None
-        log.info(f"Auto-caching disabled for {self._root_path}")
-    
-    def is_auto_caching_enabled(self) -> bool:
-        return self._file_watch_manager is not None and self._file_watch_manager.is_running()
     

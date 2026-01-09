@@ -671,7 +671,7 @@ class SerenaAgent:
             trace_lsp_communication=self.serena_config.trace_lsp_communication,
             ls_specific_settings=self.serena_config.ls_specific_settings,
         )
-        proj.build_indexs()
+        proj.startup()
 
     def add_language(self, language: Language) -> None:
         """
