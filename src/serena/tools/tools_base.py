@@ -210,10 +210,8 @@ class Tool(Component):
         if max_answer_chars <= 0:
             raise ValueError(f"Must be positive or the default (-1), got: {max_answer_chars=}")
         if (n_chars := len(result)) > max_answer_chars:
-            result = (
-                f"The answer is too long ({n_chars} characters). "
-                + "Please try a more specific tool query or raise the max_answer_chars parameter."
-            )
+            truncation_msg = f"\n\n[... truncated {n_chars - max_answer_chars} characters. Total length: {n_chars} characters.]"
+            result = result[:max_answer_chars - len(truncation_msg)] + truncation_msg
         return result
 
     def is_active(self) -> bool:

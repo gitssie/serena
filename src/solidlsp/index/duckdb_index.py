@@ -311,37 +311,27 @@ class DuckdbIndex(SymbolIndex):
     
     def query_symbols(
         self,
-        name_path_pattern: str,
-        substring_matching: bool = False,
+        name_path_regex: str,
         include_kinds: Optional[List[int]] = None,
         exclude_kinds: Optional[List[int]] = None,
-        within_relative_path: Optional[str] = None
+        relative_path_regex: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Query symbols using SQL pattern matching."""
+        """Query symbols using regex pattern matching.
+        
+        :param name_path_regex: Regular expression to match symbol name_path
+        :param include_kinds: Optional list of symbol kinds to include
+        :param exclude_kinds: Optional list of symbol kinds to exclude
+        :param relative_path_regex: Optional regex to match file relative_path
+        :return: List of document symbols matching the criteria
+        """
         with self._lock:
             if not self.is_started():
                 raise RuntimeError("Index not started. Call start() first.")
             
-            # Parse the name path pattern
-            is_absolute = name_path_pattern.startswith('/')
-            pattern = name_path_pattern.lstrip('/').rstrip('/')
-            parts = pattern.split('/') if pattern else ['']
-            
-            # Extract overload index if present
-            overload_idx = None
-            if parts[-1].endswith(']') and '[' in parts[-1]:
-                last_part = parts[-1]
-                idx_start = last_part.rfind('[')
-                try:
-                    overload_idx = int(last_part[idx_start+1:-1])
-                    parts[-1] = last_part[:idx_start]
-                except (ValueError, IndexError):
-                    pass
-            
             # Build SQL query
             sql_query, params = self._build_symbol_query(
-                parts, is_absolute, substring_matching, include_kinds,
-                exclude_kinds, within_relative_path, overload_idx
+                name_path_regex, include_kinds,
+                exclude_kinds, relative_path_regex
             )
             
             log.debug(f"Executing SQL query: {sql_query}")
@@ -359,7 +349,7 @@ class DuckdbIndex(SymbolIndex):
             group_time = time.perf_counter() - group_start_time
             
             total_time = time.perf_counter() - start_time
-            log.debug(f"Found {len(doc_symbols)} docs with symbols matching pattern '{name_path_pattern}' "
+            log.debug(f"Found {len(doc_symbols)} docs with symbols matching regex '{name_path_regex}' "
                      f"(query: {query_time:.3f}s, group: {group_time:.3f}s, total: {total_time:.3f}s)")
             
             return doc_symbols
@@ -724,11 +714,15 @@ class DuckdbIndex(SymbolIndex):
             symbol_id = self._make_symbol_id(doc_id, parent_symbol_id, symbol_name, 
                                             start_line, start_char, overload_idx)
             
-            # Build symbol path
+            # Build symbol path with overload index if needed
             if parent_path:
                 symbol_path = f"{parent_path}/{symbol_name}"
             else:
                 symbol_path = symbol_name
+            
+            # Append overload index using # symbol (regex-safe)
+            if overload_idx > 0:
+                symbol_path += f"#{overload_idx}"
             
             # Build parent IDs chain for this symbol
             current_parent_ids = parent_ids_chain.copy()
@@ -802,41 +796,29 @@ class DuckdbIndex(SymbolIndex):
     
     def _build_symbol_query(
         self,
-        parts: List[str],
-        is_absolute: bool,
-        substring_matching: bool,
+        name_path_regex: str,
         include_kinds: Optional[List[int]],
         exclude_kinds: Optional[List[int]],
-        within_relative_path: Optional[str],
-        overload_idx: Optional[int]
+        relative_path_regex: Optional[str]
     ) -> tuple:
-        """Build unified SQL query for symbol matching."""
+        """
+        Build unified SQL query for symbol matching using regex.
+        All pattern matching is done via regexp_matches() for consistency.
+        
+        :param name_path_regex: Regular expression to match symbol name_path
+        :param include_kinds: Optional list of symbol kinds to include
+        :param exclude_kinds: Optional list of symbol kinds to exclude  
+        :param relative_path_regex: Optional regex to match file relative_path
+        :return: (sql_query, params) tuple
+        """
+        from serena.symbol import NamePathMatcher
+        
         conditions = []
         params = []
         
-        # Handle name matching based on parts length
-        if len(parts) == 1:
-            # Simple name match
-            name = parts[0]
-            if name:  # Skip if empty string
-                if substring_matching:
-                    conditions.append("s.name LIKE ?")
-                    params.append(f"%{name}%")
-                else:
-                    conditions.append("s.name = ?")
-                    params.append(name)
-        else:
-            # Path match using name_path
-            path_pattern = '/'.join(parts)
-            
-            if is_absolute:
-                # Absolute path: name_path must start with the pattern
-                conditions.append("s.name_path LIKE ?")
-                params.append(f"{path_pattern}%")
-            else:
-                # Relative path: name_path contains the pattern
-                conditions.append("s.name_path LIKE ?")
-                params.append(f"%{path_pattern}%")
+        # Use the provided regex pattern directly
+        conditions.append("regexp_matches(s.name_path, ?)")
+        params.append(name_path_regex)
         
         # Kind filtering
         if include_kinds:
@@ -849,16 +831,10 @@ class DuckdbIndex(SymbolIndex):
             conditions.append(f"s.kind NOT IN ({placeholders})")
             params.extend(exclude_kinds)
         
-        # Overload index matching
-        if overload_idx is not None:
-            conditions.append("s.overload_idx = ?")
-            params.append(overload_idx)
-        
-        # Directory path filtering
-        if within_relative_path:
-            normalized_path = within_relative_path.replace('\\', '/')
-            conditions.append("d.relative_path LIKE ?")
-            params.append(f"{normalized_path}%")
+        # Directory path filtering (direct regex matching)
+        if relative_path_regex:
+            conditions.append("regexp_matches(d.relative_path, ?)")
+            params.append(relative_path_regex)
         
         where_clause = " AND ".join(conditions) if conditions else "1=1"
         
@@ -869,7 +845,7 @@ class DuckdbIndex(SymbolIndex):
             FROM {self.schema_name}.symbols s
             JOIN {self.schema_name}.docs d ON s.doc_id = d.id
             WHERE {where_clause}
-            ORDER BY d.relative_path, s.start_line
+            ORDER BY d.id, s.kind
         """
         
         return query, params

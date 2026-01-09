@@ -142,31 +142,18 @@ class SymbolIndex(ABC):
     @abstractmethod
     def query_symbols(
         self,
-        name_path_pattern: str,
-        substring_matching: bool = False,
+        name_path_regex: str,
         include_kinds: Optional[List[int]] = None,
         exclude_kinds: Optional[List[int]] = None,
-        within_relative_path: Optional[str] = None
+        relative_path_regex: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """
-        按路径模式查询符号。
+        """Query symbols using regex pattern matching.
         
-        此方法支持多种查询模式：
-        - 空字符串 "": 匹配所有符号（配合 within_relative_path 使用）
-        - 简单名称 "method": 匹配任何名为 "method" 的符号
-        - 相对路径 "class/method": 匹配 class 下的 method
-        - 绝对路径 "/class/method": 从根精确匹配
-        - 重载索引 "class/method[1]": 匹配特定重载
-        
-        :param name_path_pattern: 符号路径模式（见上述说明）
-        :param substring_matching: 是否对最后一段使用子串匹配
-        :param include_kinds: 包含的符号类型列表（如 [12] 表示方法）
-        :param exclude_kinds: 排除的符号类型列表
-        :param within_relative_path: 限制搜索到特定目录（不是文档路径）
-        :return: 文档符号列表，每个包含匹配符号的过滤树
-        
-        注意: within_relative_path 应该是目录路径。文档路径应该
-        由调用方使用 get_doc_symbols() 单独处理。
+        :param name_path_regex: Regular expression to match symbol name_path
+        :param include_kinds: Optional list of symbol kinds to include
+        :param exclude_kinds: Optional list of symbol kinds to exclude
+        :param relative_path_regex: Optional regex to match file relative_path
+        :return: List of document symbols matching the criteria
         """
         pass
     

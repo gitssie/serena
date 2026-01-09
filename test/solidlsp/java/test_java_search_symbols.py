@@ -96,10 +96,10 @@ class TestJavaSearchSymbols:
 
     @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True)
     def test_search_with_class_path(self, language_server: SolidLanguageServer) -> None:
-        """Test searching for symbols with class/method path."""
-        # Search for printHello method in Utils class
-        # Should return Utils class with printHello in its children
-        symbols = language_server.search_symbols("Utils/printHello")
+        """Test searching for symbols with class/method path (using regex)."""
+        # Search for printHello method in Utils class using regex
+        # Pattern matches "Utils/printHello" path
+        symbols = language_server.search_symbols(name_path_regex="Utils/printHello")
         
         assert len(symbols) > 0, "Should find Utils class containing printHello method"
         assert symbols[0]["name"] == "Utils", "Root symbol should be Utils class"
@@ -113,10 +113,10 @@ class TestJavaSearchSymbols:
 
     @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True)
     def test_search_absolute_path(self, language_server: SolidLanguageServer) -> None:
-        """Test searching with absolute name path."""
-        # Absolute path requires exact match from file root
-        # Should return Utils class with printHello in its children
-        symbols = language_server.search_symbols("/Utils/printHello")
+        """Test searching with absolute name path (using ^ anchor)."""
+        # Absolute path with regex anchor ^ for exact match from file root
+        # Pattern: ^Utils/printHello matches from root
+        symbols = language_server.search_symbols(name_path_regex="^Utils/printHello")
         
         assert len(symbols) > 0, "Should find Utils class with absolute path"
         assert symbols[0]["name"] == "Utils", "Root symbol should be Utils class"
@@ -125,9 +125,10 @@ class TestJavaSearchSymbols:
 
     @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True)
     def test_search_substring_matching(self, language_server: SolidLanguageServer) -> None:
-        """Test substring matching for method names."""
-        # Find all methods containing "print"
-        symbols = language_server.search_symbols("print", substring_matching=True)
+        """Test substring matching for method names (grep-like regex)."""
+        # Find all methods containing "print" using regex
+        # Simple string acts as substring match in regex
+        symbols = language_server.search_symbols(name_path_regex="print")
         
         assert len(symbols) > 0, "Should find Utils class with absolute path"
         assert symbols[0]["name"] == "Utils", "Root symbol should be Utils class"
@@ -137,9 +138,9 @@ class TestJavaSearchSymbols:
     @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True)
     def test_search_with_kind_filter(self, language_server: SolidLanguageServer) -> None:
         """Test filtering symbols by kind."""
-        # Search for all classes (kind=5)
+        # Search for all classes (kind=5) using regex
         symbols = language_server.search_symbols(
-            "Utils",
+            name_path_regex="Utils",
             include_kinds=[SymbolKind.Class]
         )
         
@@ -150,24 +151,27 @@ class TestJavaSearchSymbols:
     @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True)
     def test_search_exclude_kinds(self, language_server: SolidLanguageServer) -> None:
         """Test excluding symbol kinds."""
-        # Search for Main but exclude classes, should only get methods/fields
+        # Search for methods containing "main" but exclude methods, should return classes
+        # This tests that exclude_kinds works correctly
         symbols = language_server.search_symbols(
-            "Main",
-            exclude_kinds=[SymbolKind.Class]
+            name_path_regex="main",
+            exclude_kinds=[SymbolKind.Method, SymbolKind.Function]
         )
         
-        # Should not include the Main class itself
-        assert not any(s["kind"] == SymbolKind.Class for s in symbols), "Should not include classes"
+        # Should not include any methods
+        assert not any(s["kind"] in [SymbolKind.Method, SymbolKind.Function] for s in symbols), "Should not include methods or functions"
+        # If there are results, they should be classes or other symbol types
+        if symbols:
+            assert all(s["kind"] in [SymbolKind.Class, SymbolKind.Field, SymbolKind.Variable] for s in symbols), "Results should only contain non-method symbols"
 
     @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True)
     def test_search_within_file(self, language_server: SolidLanguageServer) -> None:
         """Test searching within a specific file."""
-        file_path = os.path.join("src", "main", "java", "test_repo", "Utils.java")
         
-        # Search for methods only in Utils.java
+        # Search for methods only in Utils.java (direct file path)
         symbols = language_server.search_symbols(
-            "printHello",
-            within_relative_path=file_path
+            name_path_regex="printHello",
+            relative_path_regex="src/main/java/test_repo/Utils.java"
         )
         
         assert len(symbols) > 0, "Should find printHello in Utils.java"
@@ -176,14 +180,119 @@ class TestJavaSearchSymbols:
             assert rel_path.endswith("Utils.java"), "All results should be from Utils.java"
 
     @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True)
-    def test_search_within_directory(self, language_server: SolidLanguageServer) -> None:
-        """Test searching within a specific directory."""
-        dir_path = os.path.join("src", "main", "java", "test_repo")
+    def test_search_overloaded_methods(self, language_server: SolidLanguageServer) -> None:
+        """Test searching for overloaded methods with # symbol notation."""
         
-        # Search for all symbols in test_repo directory
+        # Search for all printHello methods (both overloads)
         symbols = language_server.search_symbols(
-            "Main",
-            within_relative_path=dir_path
+            name_path_regex="printHello",
+            relative_path_regex="src/main/java/test_repo/Utils.java"
+        )
+        
+        assert len(symbols) > 0, "Should find Utils class with printHello methods"
+        utils_class = symbols[0]
+        assert utils_class["name"] == "Utils", "Root symbol should be Utils class"
+        
+        # Find all printHello methods in children
+        children = utils_class.get("children", [])
+        print_hello_methods = [c for c in children if c["name"] == "printHello"]
+        
+        # Utils.java has 2 overloaded printHello methods:
+        # 1. public static void printHello()
+        # 2. public static void printHello(String name)
+        assert len(print_hello_methods) == 2, f"Should find 2 overloaded printHello methods, found {len(print_hello_methods)}"
+        
+        # Verify overload indices are present
+        overload_indices = [m.get("overload_idx") for m in print_hello_methods]
+        assert 0 in overload_indices, "Should have printHello#0 (first overload)"
+        assert 1 in overload_indices, "Should have printHello#1 (second overload)"
+
+    @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True)
+    def test_search_specific_overload(self, language_server: SolidLanguageServer) -> None:
+        """Test searching for a specific overload using # notation."""
+        
+        # Search for the second overload: printHello#1 (with String parameter)
+        symbols = language_server.search_symbols(
+            name_path_regex="printHello#1",
+            relative_path_regex="src/main/java/test_repo/Utils.java"
+        )
+        
+        assert len(symbols) > 0, "Should find Utils class"
+        utils_class = symbols[0]
+        
+        # Find printHello methods in children
+        children = utils_class.get("children", [])
+        print_hello_methods = [c for c in children if "printHello" in c["name"]]
+        
+        # Should only match the specific overload #1
+        assert len(print_hello_methods) == 1, f"Should find exactly 1 printHello method matching #1, found {len(print_hello_methods)}"
+        method = print_hello_methods[0]
+        assert method.get("overload_idx") == 1, "Should be the second overload (index 1)"
+
+    @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True)
+    def test_search_overload_with_class_path(self, language_server: SolidLanguageServer) -> None:
+        """Test searching for overloaded methods with full class path."""
+        
+        # Search using full path without suffix: Utils/printHello
+        # First overload (index 0) doesn't have # suffix
+        symbols = language_server.search_symbols(
+            name_path_regex="^Utils/printHello$",
+            relative_path_regex="src/main/java/test_repo/Utils.java"
+        )
+        
+        assert len(symbols) > 0, "Should find Utils class"
+        utils_class = symbols[0]
+        assert utils_class["name"] == "Utils", "Root symbol should be Utils class"
+        
+        # Find printHello methods in children
+        children = utils_class.get("children", [])
+        print_hello_methods = [c for c in children if "printHello" in c["name"]]
+        
+        # Should match only the first overload (no parameters, no # suffix)
+        assert len(print_hello_methods) == 1, f"Should find exactly 1 printHello method (first overload), found {len(print_hello_methods)}"
+        method = print_hello_methods[0]
+        assert method.get("overload_idx") == 0, "Should be the first overload (index 0)"
+
+    @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True)
+    def test_search_exact_symbol_name(self, language_server: SolidLanguageServer) -> None:
+        """Test exact symbol name matching using regex anchors ^$ for full qualified path."""
+    
+        # Test exact match for Utils/printHello (full qualified path including package)
+        symbols = language_server.search_symbols(
+            name_path_regex="^Utils/printHello$",
+            relative_path_regex="src/main/java/test_repo/Utils.java"
+        )
+        
+        assert len(symbols) > 0, "Should find symbols with exact path match ^test_repo/Utils/printHello$"
+        
+        # Find the Utils class in the results (the package may also be included)
+        utils_class = None
+        for sym in symbols:
+            if sym["name"] == "Utils":
+                utils_class = sym
+                break
+        
+        assert utils_class is not None, "Should find Utils class in results"
+        
+        # Verify that Utils contains the printHello method
+        children = utils_class.get("children", [])
+        print_hello_methods = [c for c in children if c["name"] == "printHello"]
+        assert len(print_hello_methods) > 0, "Utils class should contain printHello method"
+        
+        # Verify exact name match
+        for method in print_hello_methods:
+            assert method["name"] == "printHello", "Method name should be exactly 'printHello'"
+
+    @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True)
+    def test_search_within_directory(self, language_server: SolidLanguageServer) -> None:
+        """Test searching within a specific directory using regex."""
+        # Use forward slashes in regex pattern to match normalized paths
+        dir_pattern = "src/main/java/test_repo"
+        
+        # Search for all symbols in test_repo directory (regex pattern)
+        symbols = language_server.search_symbols(
+            name_path_regex="Main",
+            relative_path_regex=dir_pattern
         )
         
         assert len(symbols) > 0, "Should find symbols in test_repo directory"
@@ -194,16 +303,16 @@ class TestJavaSearchSymbols:
     @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True)
     def test_search_nonexistent_symbol(self, language_server: SolidLanguageServer) -> None:
         """Test searching for non-existent symbol returns empty list."""
-        symbols = language_server.search_symbols("NonExistentMethod12345")
+        symbols = language_server.search_symbols(name_path_regex="NonExistentMethod12345")
         
         assert len(symbols) == 0, "Should return empty list for non-existent symbol"
 
     @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True)
     def test_search_parent_chain_integrity(self, language_server: SolidLanguageServer) -> None:
         """Test that parent references are correctly set up the chain."""
-        # Search for a method path and verify complete parent chain
+        # Search for a method path and verify complete parent chain using regex
         # Should return Utils class with printHello as child
-        symbols = language_server.search_symbols("Utils/printHello")
+        symbols = language_server.search_symbols(name_path_regex="Utils/printHello")
         
         assert len(symbols) > 0, "Should find Utils class"
         utils_class = symbols[0]
@@ -225,9 +334,9 @@ class TestJavaSearchSymbols:
     @pytest.mark.parametrize("language_server", [Language.JAVA], indirect=True) 
     def test_search_class_with_methods(self, language_server: SolidLanguageServer) -> None:
         """Test searching returns symbols with children populated."""
-        # Search for Utils class
+        # Search for Utils class using regex
         symbols = language_server.search_symbols(
-            "Utils",
+            name_path_regex="Utils",
             include_kinds=[SymbolKind.Class]
         )
         
@@ -508,7 +617,7 @@ class TestLanguageServerSymbolRetriever:
         configure(level=lvl)
         
         # Enable DEBUG for kuzu_symbol_cache module
-        logging.getLogger("solidlsp.util.kuzu_symbol_cache").setLevel(logging.DEBUG)
+        logging.getLogger("solidlsp").setLevel(logging.DEBUG)
         
         # Load project configuration
         serena_config = SerenaConfig.from_config_file()
@@ -526,7 +635,7 @@ class TestLanguageServerSymbolRetriever:
         try:
             ls = ls_mgr._default_language_server
             # Search for OField symbol
-            symbols = ls.search_symbols(name_path_pattern="OField") 
+            symbols = ls.search_symbols(name_path_regex="^Metadata$",relative_path_regex="type-core/src/api/Metadata.ts") 
             # Verify results
             assert len(symbols) > 0, "Should find OField symbol in the project"
             

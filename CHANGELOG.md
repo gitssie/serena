@@ -9,7 +9,7 @@ Status of the `main` branch. Changes prior to the next official version change w
         * Additional languages can be conveniently added via the Dashboard while a project is already activated.
     * The current project can be activated automatically even when the MCP configuration is global (through the --project-from-cwd flag)
     * Support overloaded symbols in `FindSymbolTool` and related tools
-        * Name paths of overloaded symbols now include an index (e.g., `myOverloadedFunction[2]`)
+        * Name paths of overloaded symbols now include an index using # symbol (e.g., `myOverloadedFunction#2`)
         * Responses of the Java language server, which handled this in its own way, are now adapted accordingly,
           solving several issues related to retrieval problems in Java projects
     * Major extensions to the dashboard, which now serves as a central web interface for Serena

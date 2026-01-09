@@ -198,7 +198,7 @@ class TestSerenaAgent:
         [
             pytest.param(
                 Language.PYTHON,
-                "OuterClass/NestedClass",
+                "/OuterClass/NestedClass",  # Use absolute path for exact match
                 False,
                 "NestedClass",
                 "Class",
@@ -208,7 +208,7 @@ class TestSerenaAgent:
             ),
             pytest.param(
                 Language.PYTHON,
-                "OuterClass/NestedClass/find_me",
+                "/OuterClass/NestedClass/find_me",  # Use absolute path for exact match
                 False,
                 "find_me",
                 "Method",
@@ -218,7 +218,7 @@ class TestSerenaAgent:
             ),
             pytest.param(
                 Language.PYTHON,
-                "OuterClass/NestedCl",  # Substring for NestedClass
+                "OuterClass/NestedCl",  # Substring for NestedClass (grep-like default)
                 True,
                 "NestedClass",
                 "Class",
@@ -228,7 +228,7 @@ class TestSerenaAgent:
             ),
             pytest.param(
                 Language.PYTHON,
-                "OuterClass/NestedClass/find_m",  # Substring for find_me
+                "OuterClass/NestedClass/find_m",  # Substring for find_me (grep-like default)
                 True,
                 "find_me",
                 "Method",
@@ -278,7 +278,6 @@ class TestSerenaAgent:
             include_body=False,
             include_kinds=None,
             exclude_kinds=None,
-            substring_matching=substring_matching,
         )
 
         symbols = json.loads(result)

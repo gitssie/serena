@@ -1332,13 +1332,14 @@ class SolidLanguageServer(ABC):
         :return: A mapping of all relative paths analyzed to lists of top-level symbols in the corresponding file.
         """
         # Use symbol index cache to query all symbols in the directory
-        # Use empty pattern to match all symbols
+        # Use empty regex pattern to match all symbols
+        # Normalize path separators for regex
+        normalized_dir_path = relative_dir_path.replace("\\", "/")
         file_symbols = self.symbol_index.query_symbols(
-            name_path_pattern="",
-            substring_matching=False,
+            name_path_regex=".*",  # Match all symbols
             include_kinds=None,
             exclude_kinds=None,
-            within_relative_path=relative_dir_path
+            relative_path_regex=normalized_dir_path  # Filter by directory path
         )
         
         # Filter and update file symbols based on file existence and content hash
@@ -1416,58 +1417,40 @@ class SolidLanguageServer(ABC):
     
     def search_symbols(
         self,
-        name_path_pattern: str,
-        substring_matching: bool = False,
+        name_path_regex: str,
         include_kinds: Sequence[SymbolKind] | None = None,
         exclude_kinds: Sequence[SymbolKind] | None = None,
-        within_relative_path: str | None = None
+        relative_path_regex: str | None = None
     ) -> list[UnifiedSymbolInformation]:
         """
-        Query symbols matching a name path pattern, optionally limited to a specific file or directory.
+        Query symbols matching a regex pattern, optionally limited to a specific file or directory.
         
         This method handles the file vs directory distinction:
-        - If within_relative_path is a file, directly queries that file's symbols
-        - If within_relative_path is a directory or None, uses Kùzu graph query for efficient lookup
+        - If relative_path_regex matches a single file, directly queries that file's symbols
+        - Otherwise, uses symbol index query for efficient lookup
         
-        :param name_path_pattern: Pattern to match symbol paths (e.g., "MyClass/my_method")
-        :param substring_matching: Whether to use substring matching for the last segment
+        :param name_path_regex: Regular expression to match symbol name_path
         :param include_kinds: List of symbol kinds to include
         :param exclude_kinds: List of symbol kinds to exclude
-        :param within_relative_path: Limit search to specific file or directory
+        :param relative_path_regex: Optional regex to match file relative_path
         :return: List of matching symbols with UnifiedSymbolInformation structure
         """
 
-        # Handle file path separately (single file)
-        if within_relative_path is not None:
-            within_abs_path = os.path.join(self.repository_root_path, within_relative_path)
-            if not os.path.exists(within_abs_path):
-                raise FileNotFoundError(f"File or directory not found: {within_abs_path}")
-            
-            if os.path.isfile(within_abs_path):
-                if self.is_ignored_path(within_relative_path):
-                    log.error("You passed a file explicitly, but it is ignored. File: %s", within_relative_path)
-                    return []
-                else:
-                    # For single file, get all symbols and use request_document_symbols
-                    root_nodes = self.request_document_symbols(within_relative_path).root_symbols
-                    return root_nodes
-        
-        # For directories or no path specified, use symbol index query if available
-        log.debug(f"Using symbol index query for pattern '{name_path_pattern}'")
+        # For regex patterns or directories, use symbol index query
+        log.debug(f"Using symbol index query for regex '{name_path_regex}'")
 
         # Convert SymbolKind to int for internal use
         include_kinds_int = [k.value if isinstance(k, SymbolKind) else k for k in include_kinds] if include_kinds else None
         exclude_kinds_int = [k.value if isinstance(k, SymbolKind) else k for k in exclude_kinds] if exclude_kinds else None
 
         file_symbols = self.symbol_index.query_symbols(
-            name_path_pattern=name_path_pattern,
-            substring_matching=substring_matching,
+            name_path_regex=name_path_regex,
             include_kinds=include_kinds_int,
             exclude_kinds=exclude_kinds_int,
-            within_relative_path=within_relative_path
+            relative_path_regex=relative_path_regex
         )
         
-        log.debug(f"query_symbols returned {len(file_symbols)} file symbols for pattern '{name_path_pattern}'")
+        log.debug(f"query_symbols returned {len(file_symbols)} file symbols for regex '{name_path_regex}'")
         
         # Filter and update file symbols based on file existence and content hash
         filtered_file_symbols = self._filter_and_update_file_symbols(file_symbols)

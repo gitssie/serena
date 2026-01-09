@@ -116,75 +116,78 @@ class Symbol(ToStringMixin, ABC):
 
 class NamePathMatcher(ToStringMixin):
     """
-    Matches name paths of symbols against search patterns.
+    Matches name paths of symbols against Linux grep-style regular expressions.
 
     A name path is a path in the symbol tree *within a source file*.
     For example, the method `my_method` defined in class `MyClass` would have the name path `MyClass/my_method`.
-    If a symbol is overloaded (e.g., in Java), a 0-based index is appended (e.g. "MyClass/my_method[0]") to
-    uniquely identify it.
-
-    A matching pattern can be:
-     * a simple name (e.g. "method"), which will match any symbol with that name
-     * a relative path like "class/method", which will match any symbol with that name path suffix
-     * an absolute name path "/class/method" (absolute name path), which requires an exact match of the full name path within the source file.
-    Append an index `[i]` to match a specific overload only, e.g. "MyClass/my_method[1]".
+    
+    This class provides in-memory filtering using regular expressions that are consistent with
+    DuckDB's regexp_matches() function. It's used to filter symbols retrieved from LSP when
+    the cache is invalidated.
+    
+    Pattern matching:
+     * Supports standard Python/POSIX regular expressions (e.g., "get.*Mappings", ".*Action/.*")
+     * Case-insensitive by default (can be overridden with case_sensitive parameter)
+     * Matches anywhere in the name path (use ^ and $ for anchoring)
+     
+    Examples:
+     * "getUser" - matches any name path containing "getuser" (case-insensitive)
+     * "^MyClass/.*" - matches name paths starting with "MyClass/"
+     * ".*Action/execute$" - matches name paths ending with "Action/execute"
+     * "get[A-Z].*" - matches name paths like "getUser", "getData" (uppercase after 'get')
     """
 
-    def __init__(self, name_path_pattern: str, substring_matching: bool) -> None:
+    def __init__(self, regex_pattern: str, case_sensitive: bool = False) -> None:
         """
-        :param name_path_pattern: the name path expression to match against
-        :param substring_matching: whether to use substring matching for the last segment
+        :param regex_pattern: Regular expression pattern to match against symbol name paths.
+            This should be a standard Python/POSIX regex pattern.
+        :param case_sensitive: Whether the matching should be case-sensitive. Default is False.
         """
-        assert name_path_pattern, "name_path must not be empty"
-        self._expr = name_path_pattern
-        self._substring_matching = substring_matching
-        self._is_absolute_pattern = name_path_pattern.startswith(NAME_PATH_SEP)
-        self._pattern_parts = name_path_pattern.lstrip(NAME_PATH_SEP).rstrip(NAME_PATH_SEP).split(NAME_PATH_SEP)
-
-        # extract overload index "[idx]" if present at end of last part
-        self._overload_idx: int | None = None
-        last_part = self._pattern_parts[-1]
-        if last_part.endswith("]") and "[" in last_part:
-            bracket_idx = last_part.rfind("[")
-            index_part = last_part[bracket_idx + 1 : -1]
-            if index_part.isdigit():
-                self._pattern_parts[-1] = last_part[:bracket_idx]
-                self._overload_idx = int(index_part)
+        import re
+        
+        assert regex_pattern, "regex_pattern must not be empty"
+        self._expr = regex_pattern
+        self._case_sensitive = case_sensitive
+        
+        # Compile the regex pattern for efficiency
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            self._compiled_regex = re.compile(regex_pattern, flags)
+        except re.error as e:
+            raise ValueError(f"Invalid regular expression pattern '{regex_pattern}': {e}")
 
     def _tostring_includes(self) -> list[str]:
         return ["_expr"]
 
     def matches_ls_symbol(self, symbol: "LanguageServerSymbol") -> bool:
-        return self.matches_components(symbol.get_name_path_parts(), symbol.overload_idx)
+        """
+        Check if a LanguageServerSymbol matches the regex pattern.
+        
+        :param symbol: The symbol to match against
+        :return: True if the symbol's name path matches the pattern
+        """
+        return self.matches_name_path(symbol.get_name_path())
+    
+    def matches_name_path(self, name_path: str) -> bool:
+        """
+        Check if a name path string matches the regex pattern.
+        
+        :param name_path: The name path string to match (e.g., "MyClass/myMethod")
+        :return: True if the name path matches the pattern
+        """
+        return bool(self._compiled_regex.search(name_path))
 
     def matches_components(self, symbol_name_path_parts: list[str], overload_idx: int | None) -> bool:
-        # filtering based on ancestors
-        if len(self._pattern_parts) > len(symbol_name_path_parts):
-            # can't possibly match if pattern has more parts than symbol
-            return False
-        if self._is_absolute_pattern and len(self._pattern_parts) != len(symbol_name_path_parts):
-            # for absolute patterns, the number of parts must match exactly
-            return False
-        if symbol_name_path_parts[-len(self._pattern_parts) : -1] != self._pattern_parts[:-1]:
-            # ancestors must match
-            return False
-
-        # matching the last part of the symbol name
-        name_to_match = self._pattern_parts[-1]
-        symbol_name = symbol_name_path_parts[-1]
-        if self._substring_matching:
-            if name_to_match not in symbol_name:
-                return False
-        else:
-            if name_to_match != symbol_name:
-                return False
-
-        # check for matching overload index
-        if self._overload_idx is not None:
-            if overload_idx != self._overload_idx:
-                return False
-
-        return True
+        """
+        Match symbol name path parts against the regex pattern.
+        This method is kept for backward compatibility but delegates to matches_name_path.
+        
+        :param symbol_name_path_parts: List of name path components (e.g., ["MyClass", "myMethod"])
+        :param overload_idx: Overload index (currently ignored as overload handling is removed)
+        :return: True if the name path matches the pattern
+        """
+        name_path = NAME_PATH_SEP.join(symbol_name_path_parts)
+        return self.matches_name_path(name_path)
 
 
 class LanguageServerSymbol(Symbol, ToStringMixin):
@@ -304,11 +307,13 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
     def get_name_path(self) -> str:
         """
         Get the name path of the symbol, e.g. "class/method/inner_function" or
-        "class/method[1]" (overloaded method with identifying index).
+        "class/method#1" (overloaded method with identifying index).
+        
+        Uses # symbol for overload index instead of [] to avoid regex special characters.
         """
         name_path = NAME_PATH_SEP.join(self.get_name_path_parts())
-        if "overload_idx" in self.symbol_root:
-            name_path += f"[{self.symbol_root['overload_idx']}]"
+        if "overload_idx" in self.symbol_root and self.symbol_root['overload_idx'] > 0:
+            name_path += f"#{self.symbol_root['overload_idx']}"
         return name_path
 
     def get_name_path_parts(self) -> list[str]:
@@ -346,22 +351,20 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
     def find(
         self,
         name_path_pattern: str,
-        substring_matching: bool = False,
         include_kinds: Sequence[SymbolKind] | None = None,
         exclude_kinds: Sequence[SymbolKind] | None = None,
     ) -> list[Self]:
         """
         Find all symbols within the symbol's subtree that match the given name path pattern.
 
-        :param name_path_pattern: the name path pattern to match against (see class :class:`NamePathMatcher` for details)
-        :param substring_matching: whether to use substring matching (as opposed to exact matching)
-            of the last segment of `name_path` against the symbol name.
+        :param name_path_pattern: Regular expression pattern to match against symbol name paths (e.g., "get.*Mappings", ".*Action/.*").
+            Uses standard Python/POSIX regex syntax. Case-insensitive by default.
         :param include_kinds: an optional sequence of ints representing the LSP symbol kind.
             If provided, only symbols of the given kinds will be included in the result.
         :param exclude_kinds: If provided, symbols of the given kinds will be excluded from the result.
         """
         result = []
-        name_path_matcher = NamePathMatcher(name_path_pattern, substring_matching)
+        name_path_matcher = NamePathMatcher(name_path_pattern)
 
         def should_include(s: "LanguageServerSymbol") -> bool:
             if include_kinds is not None and s.symbol_kind not in include_kinds:
@@ -504,36 +507,36 @@ class LanguageServerSymbolRetriever:
 
     def find(
         self,
-        name_path_pattern: str,
+        pattern: str,
+        search_in: str | None = None,
         include_kinds: Sequence[SymbolKind] | None = None,
         exclude_kinds: Sequence[SymbolKind] | None = None,
-        substring_matching: bool = False,
-        within_relative_path: str | None = None,
     ) -> list[LanguageServerSymbol]:
         """
-        Finds all symbols that match the given name path pattern (see class :class:`NamePathMatcher` for details),
-        optionally limited to a specific file and filtered by kind.
+        Finds symbols using grep-style pattern matching.
         
-        This method now leverages Kùzu's graph database capabilities for efficient symbol lookup,
-        using Cypher queries to directly match symbol paths without loading entire trees into memory.
+        :param pattern: Regular expression to match symbol name paths (like grep pattern)
+        :param search_in: Where to search - file path, directory, or regex pattern (like grep file argument)
+        :param include_kinds: Optional list of symbol kinds to include
+        :param exclude_kinds: Optional list of symbol kinds to exclude
+        :return: List of matching symbols
         """
         
         symbols: list[LanguageServerSymbol] = []
         for lang_server in self._ls_manager.iter_language_servers():
-            # Use the language server's query_symbols_by_pattern method
+            # Use the language server's search_symbols method
             # It handles file vs directory distinction internally
             symbol_roots = lang_server.search_symbols(
-                name_path_pattern=name_path_pattern,
-                substring_matching=substring_matching,
+                name_path_regex=pattern,
                 include_kinds=include_kinds,
                 exclude_kinds=exclude_kinds,
-                within_relative_path=within_relative_path
+                relative_path_regex=search_in
             )
             # Now we can directly use the filtered symbols without additional find() call
             for root in symbol_roots:
                 symbols.extend(
                     LanguageServerSymbol(root).find(
-                        name_path_pattern, include_kinds=include_kinds, exclude_kinds=exclude_kinds, substring_matching=substring_matching
+                        pattern, include_kinds=include_kinds, exclude_kinds=exclude_kinds
                     )
                 )
         return symbols
@@ -543,15 +546,13 @@ class LanguageServerSymbolRetriever:
         name_path_pattern: str,
         include_kinds: Sequence[SymbolKind] | None = None,
         exclude_kinds: Sequence[SymbolKind] | None = None,
-        substring_matching: bool = False,
         within_relative_path: str | None = None,
     ) -> LanguageServerSymbol:
         symbol_candidates = self.find(
             name_path_pattern,
+            search_in=within_relative_path,
             include_kinds=include_kinds,
             exclude_kinds=exclude_kinds,
-            substring_matching=substring_matching,
-            within_relative_path=within_relative_path,
         )
         if len(symbol_candidates) == 1:
             return symbol_candidates[0]
@@ -601,7 +602,7 @@ class LanguageServerSymbolRetriever:
         :param include_kinds: which kinds of symbols to include in the result.
         :param exclude_kinds: which kinds of symbols to exclude from the result.
         """
-        symbol = self.find_unique(name_path, substring_matching=False, within_relative_path=relative_file_path)
+        symbol = self.find_unique(name_path, within_relative_path=relative_file_path)
         return self.find_referencing_symbols_by_location(
             symbol.location, include_body=include_body, include_kinds=include_kinds, exclude_kinds=exclude_kinds
         )

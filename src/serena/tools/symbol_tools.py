@@ -77,7 +77,7 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
         # Transform to compact format
         compact_result = self._transform_symbols_to_compact_format(result)
         result_json_str = self._to_json(compact_result)
-        return self._limit_length(result_json_str, max_answer_chars)
+        return result_json_str
 
     @staticmethod
     def _transform_symbols_to_compact_format(symbols: list[dict[str, Any]]) -> dict[str, list]:
@@ -112,72 +112,75 @@ class GetSymbolsOverviewTool(Tool, ToolMarkerSymbolicRead):
 
 class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
     """
-    Performs a global (or local) search using the language server backend.
+    Searches for symbols using grep-style pattern matching.
     """
 
     # noinspection PyDefaultArgument
     def apply(
         self,
-        name_path_pattern: str,
-        depth: int = 0,
-        relative_path: str = "",
+        pattern: str,
+        search_in: str = "",
         include_body: bool = False,
         include_kinds: list[int] = [],  # noqa: B006
         exclude_kinds: list[int] = [],  # noqa: B006
-        substring_matching: bool = False,
-        max_answer_chars: int = -1,
+        max_answer_chars: int = 50000,
     ) -> str:
         """
-        Retrieves information on all symbols/code entities (classes, methods, etc.) based on the given name path pattern.
-        The returned symbol information can be used for edits or further queries.
-        Specify `depth > 0` to also retrieve children/descendants (e.g., methods of a class).
+        Searches for symbols using regular expressions (like grep).
+        
+        **Usage (Like grep)**:
+        ```
+        find_symbol("UserService")                        # Search everywhere
+        find_symbol("UserService", "src/main/java")      # Search in directory
+        find_symbol("UserService", "UserService.java")   # Search in file
+        find_symbol("get.*", ".*Controller.java")        # Both are regex
+        ```
+        
+        **Symbol Name Paths**:
+        A name path is the hierarchical path to a symbol within a source file:
+        - Method in class: "MyClass/myMethod"
+        - Nested class method: "OuterClass/InnerClass/method"
+        - Overloaded method: "MyClass/myMethod#1" (0-based index using # symbol)
 
-        A name path is a path in the symbol tree *within a source file*.
-        For example, the method `my_method` defined in class `MyClass` would have the name path `MyClass/my_method`.
-        If a symbol is overloaded (e.g., in Java), a 0-based index is appended (e.g. "MyClass/my_method[0]") to
-        uniquely identify it.
+        **Pattern Examples**:
+        - "UserService" → matches any symbol containing "UserService"
+        - "^UserService$" → matches exactly "UserService" at file root
+        - "get.*Mapping" → matches "getRequestMapping", "getPathMapping"
+        - ".*Service$" → matches symbols ending with "Service"
+        - "^com/example/.*" → matches symbols in com.example package
+        
+        **Search Scope (search_in)**:
+        - Empty/omitted: searches entire workspace
+        - File path: "src/UserService.java" (if file exists, searches only that file)
+        - Directory: "src/main/java" (searches all files in directory)
+        - Regex: ".*\\.java$" (matches files by regex pattern)
+        
+        **Note**: This tool returns matched symbols without their children. 
+        Use `get_symbols_overview` tool to see the detailed structure of a specific file/symbol.
 
-        To search for a symbol, you provide a name path pattern that is used to match against name paths.
-        It can be
-         * a simple name (e.g. "method"), which will match any symbol with that name
-         * a relative path like "class/method", which will match any symbol with that name path suffix
-         * an absolute name path "/class/method" (absolute name path), which requires an exact match of the full name path within the source file.
-        Append an index `[i]` to match a specific overload only, e.g. "MyClass/my_method[1]".
-
-        :param name_path_pattern: the name path matching pattern (see above)
-        :param depth: depth up to which descendants shall be retrieved (e.g. use 1 to also retrieve immediate children;
-            for the case where the symbol is a class, this will return its methods).
-            Default 0.
-        :param relative_path: Optional. Restrict search to this file or directory. If None, searches entire codebase.
-            If a directory is passed, the search will be restricted to the files in that directory.
-            If a file is passed, the search will be restricted to that file.
-            If you have some knowledge about the codebase, you should use this parameter, as it will significantly
-            speed up the search as well as reduce the number of results.
-        :param include_body: If True, include the symbol's source code. Use judiciously.
-        :param include_kinds: Optional. List of LSP symbol kind integers to include. (e.g., 5 for Class, 12 for Function).
-            Valid kinds: 1=file, 2=module, 3=namespace, 4=package, 5=class, 6=method, 7=property, 8=field, 9=constructor, 10=enum,
-            11=interface, 12=function, 13=variable, 14=constant, 15=string, 16=number, 17=boolean, 18=array, 19=object,
-            20=key, 21=null, 22=enum member, 23=struct, 24=event, 25=operator, 26=type parameter.
-            If not provided, all kinds are included.
-        :param exclude_kinds: Optional. List of LSP symbol kind integers to exclude. Takes precedence over `include_kinds`.
-            If not provided, no kinds are excluded.
-        :param substring_matching: If True, use substring matching for the last element of the pattern, such that
-            "Foo/get" would match "Foo/getValue" and "Foo/getData".
-        :param max_answer_chars: Max characters for the JSON result. If exceeded, no content is returned.
-            -1 means the default value from the config will be used.
-        :return: a list of symbols (with locations) matching the name.
+        :param pattern: Regular expression to match symbol name paths (what to search for)
+        :param search_in: Where to search (file path, directory, or regex). Empty = search everywhere.
+        :param include_body: Include symbol source code in results (use carefully, increases size)
+        :param include_kinds: List of LSP symbol kinds to include (e.g., [5] for classes, [12] for functions).
+            Common: 5=class, 6=method, 12=function, 13=variable, 10=enum, 11=interface.
+            Full list: 1=file, 2=module, 3=namespace, 4=package, 5=class, 6=method, 7=property, 8=field,
+            9=constructor, 10=enum, 11=interface, 12=function, 13=variable, 14=constant, 22=enum member,
+            23=struct. Empty = include all.
+        :param exclude_kinds: Symbol kinds to exclude (takes precedence over include_kinds)
+        :param max_answer_chars: Max result size in characters (default 50000).
+        :return: JSON list of matching symbols with metadata (name_path, kind, location, body)
         """
         parsed_include_kinds: Sequence[SymbolKind] | None = [SymbolKind(k) for k in include_kinds] if include_kinds else None
         parsed_exclude_kinds: Sequence[SymbolKind] | None = [SymbolKind(k) for k in exclude_kinds] if exclude_kinds else None
         symbol_retriever = self.create_language_server_symbol_retriever()
         symbols = symbol_retriever.find(
-            name_path_pattern,
+            pattern=pattern,
+            search_in=search_in or None,
             include_kinds=parsed_include_kinds,
             exclude_kinds=parsed_exclude_kinds,
-            substring_matching=substring_matching,
-            within_relative_path=relative_path,
         )
-        symbol_dicts = [_sanitize_symbol_dict(s.to_dict(kind=True, location=True, depth=depth, include_body=include_body)) for s in symbols]
+        # depth=0 to only return the matched symbols, no children
+        symbol_dicts = [_sanitize_symbol_dict(s.to_dict(kind=True, location=True, depth=0, include_body=include_body)) for s in symbols]
         result = self._to_json(symbol_dicts)
         return self._limit_length(result, max_answer_chars)
 
@@ -349,24 +352,36 @@ class DiagnosticsTool(Tool, ToolMarkerSymbolicRead):
     Requests diagnostics for a given file from the language server.
     """
 
-    def apply(self, relative_path: str) -> str:
+    def apply(self, relative_path: str, max_answer_chars: int = -1) -> str:
         """
         Retrieves diagnostics (errors, warnings, information, hints, etc.) for the given file from the language server.
         Diagnostics include compilation errors, warnings, linting issues, type errors, and code quality suggestions.
         The diagnostic 'code' field often contains error codes that can be used to identify specific issues.
 
         :param relative_path: the relative path to the file to retrieve diagnostics for
-        :return: a JSON object containing the list of diagnostics for the file
+        :param max_answer_chars: maximum number of characters for the result. If the result is longer than this,
+            an error message will be returned. Use -1 for the default limit from the config.
+        :return: a JSON array of diagnostic objects. Each diagnostic contains:
+            - severity: integer (1=Error, 2=Warning, 3=Information, 4=Hint)
+            - message: string describing the issue or status
+            - range: optional object with start/end line and character positions
+            
+            Special status messages:
+            - "Diagnostics check completed successfully - no issues found" (severity=3): Analysis passed with no problems
+            - "Timeout ({n}s) waiting for diagnostics" (severity=2): Language server timeout occurred
         """
         symbol_retriever = self.create_language_server_symbol_retriever()
         diagnostics = symbol_retriever.request_text_document_diagnostics(relative_path, timeout=30)
-        diagnostics_list = [
-            {
+        diagnostics_list = []
+        for diag in diagnostics:
+            item = {
                 "severity": diag["severity"],
-                "message": diag["message"],
-                "range": diag["range"]
+                "message": diag["message"]
             }
-            for diag in diagnostics
-        ]
-        return self._to_json(diagnostics_list)
+            # range is optional - only include if present
+            if "range" in diag:
+                item["range"] = diag["range"]
+            diagnostics_list.append(item)
+        result = self._to_json(diagnostics_list)
+        return self._limit_length(result, max_answer_chars)
 

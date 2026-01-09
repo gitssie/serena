@@ -15,6 +15,7 @@ import pytest
 
 from solidlsp.index import DuckdbIndex
 from solidlsp import ls_types
+from serena.symbol import NamePathMatcher
 
 
 @pytest.fixture
@@ -375,14 +376,20 @@ class TestDuckdbIndexRetrieval:
 class TestDuckdbIndexQuery:
     """Test query operations (query_symbols)."""
     
+    @staticmethod
+    def _pattern_to_regex(pattern: str) -> str:
+        """Helper to convert pattern to regex for testing."""
+        from serena.symbol import NamePathMatcher
+        is_absolute = pattern.startswith('/')
+        return NamePathMatcher._convert_name_path_to_regex(pattern, is_absolute)
+    
     def test_query_all_symbols(self, duckdb_index, sample_symbol_tree):
         """Test querying all symbols with empty pattern."""
         duckdb_index.start()
         duckdb_index.store_doc_symbols("module.py", "hash1", sample_symbol_tree)
         
         results = duckdb_index.query_symbols(
-            name_path_pattern="",
-            substring_matching=False
+            name_path_regex=self._pattern_to_regex("")
         )
         
         assert len(results) == 1
@@ -394,8 +401,7 @@ class TestDuckdbIndexQuery:
         duckdb_index.store_doc_symbols("module.py", "hash1", sample_symbol_tree)
         
         results = duckdb_index.query_symbols(
-            name_path_pattern="TestClass",
-            substring_matching=False
+            name_path_regex=self._pattern_to_regex("TestClass")
         )
         
         assert len(results) == 1
@@ -409,8 +415,7 @@ class TestDuckdbIndexQuery:
         duckdb_index.store_doc_symbols("module.py", "hash1", sample_symbol_tree)
         
         results = duckdb_index.query_symbols(
-            name_path_pattern="TestClass/method_one",
-            substring_matching=False
+            name_path_regex=self._pattern_to_regex("TestClass/method_one")
         )
         
         assert len(results) == 1
@@ -422,13 +427,12 @@ class TestDuckdbIndexQuery:
         assert any(c['name'] == 'method_one' for c in class_sym['children'])
     
     def test_query_with_substring_matching(self, duckdb_index, sample_symbol_tree):
-        """Test substring matching in queries."""
+        """Test substring matching in queries (default grep-like behavior)."""
         duckdb_index.start()
         duckdb_index.store_doc_symbols("module.py", "hash1", sample_symbol_tree)
         
         results = duckdb_index.query_symbols(
-            name_path_pattern="method",
-            substring_matching=True
+            name_path_regex=self._pattern_to_regex("method")
         )
         
         assert len(results) == 1
@@ -446,8 +450,7 @@ class TestDuckdbIndexQuery:
         
         # Query only methods (kind 6)
         results = duckdb_index.query_symbols(
-            name_path_pattern="",
-            substring_matching=False,
+            name_path_regex=self._pattern_to_regex(""),
             include_kinds=[6]  # Method kind
         )
         
@@ -467,8 +470,7 @@ class TestDuckdbIndexQuery:
         
         # Exclude variables (kind 13)
         results = duckdb_index.query_symbols(
-            name_path_pattern="",
-            substring_matching=False,
+            name_path_regex=self._pattern_to_regex(""),
             exclude_kinds=[13]  # Variable kind
         )
         
@@ -490,11 +492,10 @@ class TestDuckdbIndexQuery:
         duckdb_index.store_doc_symbols("src/core/module.py", "hash1", sample_symbol_tree)
         duckdb_index.store_doc_symbols("tests/test_module.py", "hash2", sample_symbol_tree)
         
-        # Query only in src/core
+        # Query only in src/core - use direct regex pattern
         results = duckdb_index.query_symbols(
-            name_path_pattern="",
-            substring_matching=False,
-            within_relative_path="src/core"
+            name_path_regex=self._pattern_to_regex(""),
+            relative_path_regex="src/core"  # Direct regex pattern for path matching
         )
         
         assert len(results) == 1

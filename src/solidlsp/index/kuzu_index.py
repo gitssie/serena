@@ -270,11 +270,10 @@ class KuzuIndex(SymbolIndex):
     
     def query_symbols(
         self,
-        name_path_pattern: str,
-        substring_matching: bool = False,
+        name_path_regex: str,
         include_kinds: Optional[List[int]] = None,
         exclude_kinds: Optional[List[int]] = None,
-        within_relative_path: Optional[str] = None
+        relative_path_regex: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         Query symbols using Cypher to match name path patterns directly in the graph database.
@@ -282,36 +281,30 @@ class KuzuIndex(SymbolIndex):
         This method leverages Kùzu's graph traversal capabilities to efficiently find symbols
         based on their hierarchical path, avoiding the need to load entire symbol trees into memory.
         
-        NOTE: within_relative_path should be a directory path or None. Doc paths should be
+        NOTE: relative_path_regex should be a directory path or None. Doc paths should be
         handled by the caller using request_document_symbols() directly.
         
-        :param name_path_pattern: Pattern to match symbol paths:
-            - Empty string: "" matches all symbols (when used with within_relative_path)
-            - Simple name: "method" matches any symbol named "method"
-            - Relative path: "class/method" matches method under class
-            - Absolute path: "/class/method" matches exact path from root
-            - Overload index: "class/method[1]" matches specific overload
-        :param substring_matching: Whether to use substring matching for the last segment
+        :param name_path_regex: Regular expression to match symbol name_path
         :param include_kinds: List of symbol kinds to include (e.g., [12] for methods)
         :param exclude_kinds: List of symbol kinds to exclude
-        :param within_relative_path: Limit search to directory (NOT doc - docs should be handled separately)
+        :param relative_path_regex: Limit search to directory (NOT doc - docs should be handled separately)
         :return: List of symbol dictionaries with full UnifiedSymbolInformation structure
         """
         with self._lock:
             # Parse the name path pattern
-            is_absolute = name_path_pattern.startswith('/')
-            pattern = name_path_pattern.lstrip('/').rstrip('/')
+            is_absolute = name_path_regex.startswith('/')
+            pattern = name_path_regex.lstrip('/').rstrip('/')
             
             # Handle empty pattern - split will give ['']
             parts = pattern.split('/') if pattern else ['']
             
-            # Extract overload index if present
+            # Extract overload index if present (format: method#1)
             overload_idx = None
-            if parts[-1].endswith(']') and '[' in parts[-1]:
+            if '#' in parts[-1]:
                 last_part = parts[-1]
-                idx_start = last_part.rfind('[')
+                idx_start = last_part.rfind('#')
                 try:
-                    overload_idx = int(last_part[idx_start+1:-1])
+                    overload_idx = int(last_part[idx_start+1:])
                     parts[-1] = last_part[:idx_start]
                 except (ValueError, IndexError):
                     pass
@@ -320,14 +313,14 @@ class KuzuIndex(SymbolIndex):
             if len(parts) == 1:
                 # Simple name match: match any symbol with this name
                 cypher_query = self._build_simple_name_query(
-                    parts[0], substring_matching, include_kinds, exclude_kinds,
-                    within_relative_path, overload_idx
+                    parts[0], include_kinds, exclude_kinds,
+                    relative_path_regex, overload_idx
                 )
             else:
                 # Path match: use graph traversal to match parent-child relationships
                 cypher_query = self._build_path_match_query(
-                    parts, is_absolute, substring_matching, include_kinds,
-                    exclude_kinds, within_relative_path, overload_idx
+                    parts, is_absolute, include_kinds,
+                    exclude_kinds, relative_path_regex, overload_idx
                 )
             
             log.debug(f"Executing Cypher query: {cypher_query}")
@@ -349,16 +342,15 @@ class KuzuIndex(SymbolIndex):
             group_time = time.perf_counter() - group_start_time
             
             total_time = time.perf_counter() - start_time
-            log.debug(f"Found {len(doc_symbols)} docs with symbols matching pattern '{name_path_pattern}' (query: {query_time:.3f}s, group: {group_time:.3f}s, total: {total_time:.3f}s)")
+            log.debug(f"Found {len(doc_symbols)} docs with symbols matching pattern '{name_path_regex}' (query: {query_time:.3f}s, group: {group_time:.3f}s, total: {total_time:.3f}s)")
             return doc_symbols
     
     def _build_simple_name_query(
         self,
         name: str,
-        substring_matching: bool,
         include_kinds: Optional[List[int]],
         exclude_kinds: Optional[List[int]],
-        within_relative_path: Optional[str],
+        relative_path_regex: Optional[str],
         overload_idx: Optional[int]
     ) -> str:
         """Build Cypher query for simple name matching."""
@@ -366,10 +358,8 @@ class KuzuIndex(SymbolIndex):
         
         # Name matching condition (skip if empty string)
         if name:
-            if substring_matching:
-                conditions.append(f"s.name CONTAINS '{name}'")
-            else:
-                conditions.append(f"s.name = '{name}'")
+            # Use regex matching with =~ operator
+            conditions.append(f"s.name =~ '{name}'")
         
         # Kind filtering
         if include_kinds:
@@ -385,9 +375,9 @@ class KuzuIndex(SymbolIndex):
         
         # Directory path filtering (doc paths should be handled separately by caller)
         doc_condition = ""
-        if within_relative_path:
+        if relative_path_regex:
             # Normalize path separators
-            normalized_path = within_relative_path.replace('\\', '/')
+            normalized_path = relative_path_regex.replace('\\', '/')
             # Always use prefix match for directories
             doc_condition = f" AND d.relative_path STARTS WITH '{normalized_path}'"
         
@@ -403,10 +393,9 @@ class KuzuIndex(SymbolIndex):
         self,
         parts: List[str],
         is_absolute: bool,
-        substring_matching: bool,
         include_kinds: Optional[List[int]],
         exclude_kinds: Optional[List[int]],
-        within_relative_path: Optional[str],
+        relative_path_regex: Optional[str],
         overload_idx: Optional[int]
     ) -> str:
         """
@@ -419,10 +408,7 @@ class KuzuIndex(SymbolIndex):
         
         # Build target symbol conditions (last part of path)
         target_conditions = []
-        if substring_matching:
-            target_conditions.append(f"target.name CONTAINS '{parts[-1]}'")
-        else:
-            target_conditions.append(f"target.name = '{parts[-1]}'")
+        target_conditions.append(f"target.name =~ '{parts[-1]}'")
         
         # Kind filtering on target
         if include_kinds:
@@ -440,8 +426,8 @@ class KuzuIndex(SymbolIndex):
         
         # Directory path filtering
         doc_condition = ""
-        if within_relative_path:
-            normalized_path = within_relative_path.replace('\\', '/')
+        if relative_path_regex:
+            normalized_path = relative_path_regex.replace('\\', '/')
             doc_condition = f" AND d.relative_path STARTS WITH '{normalized_path}'"
         
         if depth == 2:
@@ -455,7 +441,7 @@ class KuzuIndex(SymbolIndex):
                     MATCH (d:Doc)-[:PART_OF]->(target:Symbol)
                     WHERE {target_where}{doc_condition}
                     MATCH (parent:Symbol)-[:PARENT_OF]->(target)
-                    WHERE parent.name = '{parent_name}'
+                    WHERE parent.name =~ '{parent_name}'
                         AND (d)-[:DEFINES]->(parent)
                     RETURN target.id AS symbol_id
                 """
@@ -465,7 +451,7 @@ class KuzuIndex(SymbolIndex):
                     MATCH (d:Doc)-[:PART_OF]->(target:Symbol)
                     WHERE {target_where}{doc_condition}
                     MATCH (parent:Symbol)-[:PARENT_OF]->(target)
-                    WHERE parent.name = '{parent_name}'
+                    WHERE parent.name =~ '{parent_name}'
                     RETURN target.id AS symbol_id
                 """
         else:
@@ -484,7 +470,7 @@ class KuzuIndex(SymbolIndex):
                     MATCH path = (root:Symbol)-[:PARENT_OF*{depth-1}]->(target)
                     WHERE (d)-[:DEFINES]->(root)
                         AND size(nodes(path)) = {depth}
-                        AND root.name = '{parts[0]}'
+                        AND root.name =~ '{parts[0]}'
                 """
             else:
                 # Relative path: root can be anywhere in the tree
@@ -493,15 +479,15 @@ class KuzuIndex(SymbolIndex):
                     WHERE {target_where}{doc_condition}
                     MATCH path = (root:Symbol)-[:PARENT_OF*{depth-1}]->(target)
                     WHERE size(nodes(path)) = {depth}
-                        AND root.name = '{parts[0]}'
+                        AND root.name =~ '{parts[0]}'
                 """
             
-            # Add validation for all intermediate node names
-            # We need to check that nodes(path)[i].name = parts[i] for all i
+            # Add validation for all intermediate node names using regex
+            # We need to check that nodes(path)[i].name matches parts[i] for all i
             for i in range(1, depth - 1):
                 # parts[i] corresponds to nodes(path)[i]
                 # Note: In Cypher, nodes(path)[0] is root, nodes(path)[depth-1] is target
-                query += f"\n AND nodes(path)[{i}].name = '{parts[i]}'"
+                query += f"\n AND nodes(path)[{i}].name =~ '{parts[i]}'"
             
             query += "\n RETURN target.id AS symbol_id"
         

@@ -220,16 +220,25 @@ class EclipseJDTLS(SolidLanguageServer):
                 if waiter['event'].wait(timeout):
                     diagnostics = waiter['diagnostics']
                     if diagnostics is None:
-                        return []
+                        # No diagnostics means the file has no errors
+                        return [{
+                            "uri": uri,
+                            "severity": 3,  # Information
+                            "message": "Diagnostics check completed successfully - no issues found"
+                        }]
                     
                     # Convert to ls_types.Diagnostic format
                     from solidlsp import ls_types
                     ret: list[ls_types.Diagnostic] = []
                     for item in diagnostics:
+                        message = item.get("message", "")
+                        # Filter out Type safety warnings (unchecked conversion warnings for Java generics)
+                        if message.startswith("Type safety:"):
+                            continue
                         new_item: ls_types.Diagnostic = {
                             "uri": uri,
                             "severity": item.get("severity", 1),
-                            "message": item.get("message", ""),
+                            "message": message,
                             "range": item["range"],
                             "code": item.get("code"),
                         }
@@ -237,7 +246,12 @@ class EclipseJDTLS(SolidLanguageServer):
                     return ret
                 else:
                     log.warning(f"Timeout ({timeout}s) waiting for diagnostics for {relative_file_path}")
-                    return []
+                    # Return diagnostic message indicating timeout
+                    return [{
+                        "uri": uri,
+                        "severity": 2,  # Warning
+                        "message": f"Timeout ({timeout}s) waiting for diagnostics"
+                    }]
             finally:
                 # Clean up waiter immediately after use
                 with self._diagnostics_lock:

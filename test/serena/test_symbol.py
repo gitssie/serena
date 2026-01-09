@@ -1,178 +1,104 @@
 import pytest
+import re
 
 from serena.symbol import NamePathMatcher
 
 
 class TestSymbolNameMatching:
+    """
+    Tests for NamePathMatcher with Linux grep-style regular expression support.
+    The behavior should be consistent with DuckDB's regexp_matches() function.
+    """
+    
     def _create_assertion_error_message(
         self,
-        name_path_pattern: str,
-        symbol_name_path_parts: list[str],
-        is_substring_match: bool,
+        regex_pattern: str,
+        name_path: str,
         expected_result: bool,
         actual_result: bool,
     ) -> str:
         """Helper to create a detailed error message for assertions."""
-        qnp_repr = "/".join(symbol_name_path_parts)
-
         return (
-            f"Pattern '{name_path_pattern}' (substring: {is_substring_match}) vs "
-            f"Qualname parts {symbol_name_path_parts} (as '{qnp_repr}'). "
+            f"Pattern '{regex_pattern}' vs Name path '{name_path}'. "
             f"Expected: {expected_result}, Got: {actual_result}"
         )
 
     @pytest.mark.parametrize(
-        "name_path_pattern, symbol_name_path_parts, is_substring_match, expected",
+        "regex_pattern, name_path, expected",
         [
-            # Exact matches, anywhere in the name (is_substring_match=False)
-            pytest.param("foo", ["foo"], False, True, id="'foo' matches 'foo' exactly (simple)"),
-            pytest.param("foo/", ["foo"], False, True, id="'foo/' matches 'foo' exactly (simple)"),
-            pytest.param("foo", ["bar", "foo"], False, True, id="'foo' matches ['bar', 'foo'] exactly (simple, last element)"),
-            pytest.param("foo", ["foobar"], False, False, id="'foo' does not match 'foobar' exactly (simple)"),
-            pytest.param(
-                "foo", ["bar", "foobar"], False, False, id="'foo' does not match ['bar', 'foobar'] exactly (simple, last element)"
-            ),
-            pytest.param(
-                "foo", ["path", "to", "foo"], False, True, id="'foo' matches ['path', 'to', 'foo'] exactly (simple, last element)"
-            ),
-            # Exact matches, absolute patterns (is_substring_match=False)
-            pytest.param("/foo", ["foo"], False, True, id="'/foo' matches ['foo'] exactly (absolute simple)"),
-            pytest.param("/foo", ["foo", "bar"], False, False, id="'/foo' does not match ['foo', 'bar'] (absolute simple, len mismatch)"),
-            pytest.param("/foo", ["bar"], False, False, id="'/foo' does not match ['bar'] (absolute simple, name mismatch)"),
-            pytest.param(
-                "/foo", ["bar", "foo"], False, False, id="'/foo' does not match ['bar', 'foo'] (absolute simple, position mismatch)"
-            ),
-            # Substring matches, anywhere in the name (is_substring_match=True)
-            pytest.param("foo", ["foobar"], True, True, id="'foo' matches 'foobar' as substring (simple)"),
-            pytest.param("foo", ["bar", "foobar"], True, True, id="'foo' matches ['bar', 'foobar'] as substring (simple, last element)"),
-            pytest.param(
-                "foo", ["barfoo"], True, True, id="'foo' matches 'barfoo' as substring (simple)"
-            ),  # This was potentially ambiguous before
-            pytest.param("foo", ["baz"], True, False, id="'foo' does not match 'baz' as substring (simple)"),
-            pytest.param("foo", ["bar", "baz"], True, False, id="'foo' does not match ['bar', 'baz'] as substring (simple, last element)"),
-            pytest.param("foo", ["my_foobar_func"], True, True, id="'foo' matches 'my_foobar_func' as substring (simple)"),
-            pytest.param(
-                "foo",
-                ["ClassA", "my_foobar_method"],
-                True,
-                True,
-                id="'foo' matches ['ClassA', 'my_foobar_method'] as substring (simple, last element)",
-            ),
-            pytest.param("foo", ["my_bar_func"], True, False, id="'foo' does not match 'my_bar_func' as substring (simple)"),
-            # Substring matches, absolute patterns (is_substring_match=True)
-            pytest.param("/foo", ["foobar"], True, True, id="'/foo' matches ['foobar'] as substring (absolute simple)"),
-            pytest.param("/foo/", ["foobar"], True, True, id="'/foo/' matches ['foobar'] as substring (absolute simple, last element)"),
-            pytest.param("/foo", ["barfoobaz"], True, True, id="'/foo' matches ['barfoobaz'] as substring (absolute simple)"),
-            pytest.param(
-                "/foo", ["foo", "bar"], True, False, id="'/foo' does not match ['foo', 'bar'] as substring (absolute simple, len mismatch)"
-            ),
-            pytest.param("/foo", ["bar"], True, False, id="'/foo' does not match ['bar'] (absolute simple, no substr)"),
-            pytest.param(
-                "/foo", ["bar", "foo"], True, False, id="'/foo' does not match ['bar', 'foo'] (absolute simple, position mismatch)"
-            ),
-            pytest.param(
-                "/foo/", ["bar", "foo"], True, False, id="'/foo/' does not match ['bar', 'foo'] (absolute simple, position mismatch)"
-            ),
+            # Basic substring matching (grep-style default behavior)
+            pytest.param("foo", "foo", True, id="'foo' matches 'foo'"),
+            pytest.param("foo", "MyClass/foo", True, id="'foo' matches 'MyClass/foo'"),
+            pytest.param("foo", "MyClass/foobar", True, id="'foo' matches 'MyClass/foobar'"),
+            pytest.param("foo", "MyClass/barfoo", True, id="'foo' matches 'MyClass/barfoo'"),
+            pytest.param("foo", "MyClass/bar", False, id="'foo' does not match 'MyClass/bar'"),
+            
+            # Anchored matching
+            pytest.param("^foo", "foo", True, id="'^foo' matches 'foo' at start"),
+            pytest.param("^foo", "MyClass/foo", False, id="'^foo' does not match 'MyClass/foo'"),
+            pytest.param("foo$", "MyClass/foo", True, id="'foo$' matches 'MyClass/foo' at end"),
+            pytest.param("foo$", "MyClass/foobar", False, id="'foo$' does not match 'MyClass/foobar'"),
+            pytest.param("^foo$", "foo", True, id="'^foo$' matches exactly 'foo'"),
+            pytest.param("^foo$", "foobar", False, id="'^foo$' does not match 'foobar'"),
+            
+            # Path matching
+            pytest.param("MyClass/foo", "MyClass/foo", True, id="'MyClass/foo' matches 'MyClass/foo'"),
+            pytest.param("MyClass/foo", "com/example/MyClass/foo", True, id="'MyClass/foo' matches 'com/example/MyClass/foo'"),
+            pytest.param("^MyClass/foo$", "MyClass/foo", True, id="'^MyClass/foo$' matches exactly 'MyClass/foo'"),
+            pytest.param("^MyClass/foo$", "com/example/MyClass/foo", False, id="'^MyClass/foo$' does not match 'com/example/MyClass/foo'"),
+            
+            # Wildcard patterns (.*)
+            # Wildcard patterns (.*)
+            pytest.param("get.*", "getUser", True, id="'get.*' matches 'getUser'"),
+            pytest.param("get.*", "MyClass/getUserById", True, id="'get.*' matches 'MyClass/getUserById'"),
+            pytest.param("get.*", "setUser", False, id="'get.*' does not match 'setUser'"),
+            pytest.param(".*Action/.*", "AdminAction/execute", True, id="'.*Action/.*' matches 'AdminAction/execute'"),
+            pytest.param(".*Action/.*", "MyController/handle", False, id="'.*Action/.*' does not match 'MyController/handle'"),
+            
+            # Character class
+            pytest.param("get[A-Z].*", "getUser", True, id="'get[A-Z].*' matches 'getUser'"),
+            pytest.param("get[A-Z].*", "getuser", False, id="'get[A-Z].*' does not match 'getuser' (case-sensitive in character class)"),
+            
+            # Optional patterns
+            pytest.param("handle?", "handle", True, id="'handle?' matches 'handle'"),
+            pytest.param("handle?", "handler", True, id="'handle?' matches 'handler'"),
+            
+            # Case insensitivity (default)
+            pytest.param("myclass", "MyClass/myMethod", True, id="'myclass' matches 'MyClass/myMethod' (case-insensitive)"),
         ],
     )
-    def test_match_simple_name(self, name_path_pattern, symbol_name_path_parts, is_substring_match, expected):
-        """Tests matching for simple names (no '/' in pattern)."""
-        result = NamePathMatcher(name_path_pattern, is_substring_match).matches_components(symbol_name_path_parts, None)
-        error_msg = self._create_assertion_error_message(name_path_pattern, symbol_name_path_parts, is_substring_match, expected, result)
+    def test_regex_matching(self, regex_pattern, name_path, expected):
+        """Tests regex matching for symbol name paths."""
+        matcher = NamePathMatcher(regex_pattern)
+        result = matcher.matches_name_path(name_path)
+        error_msg = self._create_assertion_error_message(regex_pattern, name_path, expected, result)
         assert result == expected, error_msg
-
+    
     @pytest.mark.parametrize(
-        "name_path_pattern, symbol_name_path_parts, is_substring_match, expected",
+        "regex_pattern, symbol_name_path_parts, expected",
         [
-            # --- Relative patterns (suffix matching) ---
-            # Exact matches, relative patterns (is_substring_match=False)
-            pytest.param("bar/foo", ["bar", "foo"], False, True, id="R: 'bar/foo' matches ['bar', 'foo'] exactly"),
-            pytest.param("bar/foo", ["mod", "bar", "foo"], False, True, id="R: 'bar/foo' matches ['mod', 'bar', 'foo'] exactly (suffix)"),
-            pytest.param(
-                "bar/foo", ["bar", "foo", "baz"], False, False, id="R: 'bar/foo' does not match ['bar', 'foo', 'baz'] (pattern shorter)"
-            ),
-            pytest.param("bar/foo", ["bar"], False, False, id="R: 'bar/foo' does not match ['bar'] (pattern longer)"),
-            pytest.param("bar/foo", ["baz", "foo"], False, False, id="R: 'bar/foo' does not match ['baz', 'foo'] (first part mismatch)"),
-            pytest.param("bar/foo", ["bar", "baz"], False, False, id="R: 'bar/foo' does not match ['bar', 'baz'] (last part mismatch)"),
-            pytest.param("bar/foo", ["foo"], False, False, id="R: 'bar/foo' does not match ['foo'] (pattern longer)"),
-            pytest.param(
-                "bar/foo", ["other", "foo"], False, False, id="R: 'bar/foo' does not match ['other', 'foo'] (first part mismatch)"
-            ),
-            pytest.param(
-                "bar/foo", ["bar", "otherfoo"], False, False, id="R: 'bar/foo' does not match ['bar', 'otherfoo'] (last part mismatch)"
-            ),
-            # Substring matches, relative patterns (is_substring_match=True)
-            pytest.param("bar/foo", ["bar", "foobar"], True, True, id="R: 'bar/foo' matches ['bar', 'foobar'] as substring"),
-            pytest.param(
-                "bar/foo", ["mod", "bar", "foobar"], True, True, id="R: 'bar/foo' matches ['mod', 'bar', 'foobar'] as substring (suffix)"
-            ),
-            pytest.param("bar/foo", ["bar", "bazfoo"], True, True, id="R: 'bar/foo' matches ['bar', 'bazfoo'] as substring"),
-            pytest.param("bar/fo", ["bar", "foo"], True, True, id="R: 'bar/fo' matches ['bar', 'foo'] as substring"),  # codespell:ignore
-            pytest.param("bar/foo", ["bar", "baz"], True, False, id="R: 'bar/foo' does not match ['bar', 'baz'] (last no substr)"),
-            pytest.param(
-                "bar/foo", ["baz", "foobar"], True, False, id="R: 'bar/foo' does not match ['baz', 'foobar'] (first part mismatch)"
-            ),
-            pytest.param(
-                "bar/foo", ["bar", "my_foobar_method"], True, True, id="R: 'bar/foo' matches ['bar', 'my_foobar_method'] as substring"
-            ),
-            pytest.param(
-                "bar/foo",
-                ["mod", "bar", "my_foobar_method"],
-                True,
-                True,
-                id="R: 'bar/foo' matches ['mod', 'bar', 'my_foobar_method'] as substring (suffix)",
-            ),
-            pytest.param(
-                "bar/foo",
-                ["bar", "another_method"],
-                True,
-                False,
-                id="R: 'bar/foo' does not match ['bar', 'another_method'] (last no substr)",
-            ),
-            pytest.param(
-                "bar/foo",
-                ["other", "my_foobar_method"],
-                True,
-                False,
-                id="R: 'bar/foo' does not match ['other', 'my_foobar_method'] (first part mismatch)",
-            ),
-            pytest.param("bar/f", ["bar", "foo"], True, True, id="R: 'bar/f' matches ['bar', 'foo'] as substring"),
-            # Exact matches, absolute patterns (is_substring_match=False)
-            pytest.param("/bar/foo", ["bar", "foo"], False, True, id="A: '/bar/foo' matches ['bar', 'foo'] exactly"),
-            pytest.param(
-                "/bar/foo", ["bar", "foo", "baz"], False, False, id="A: '/bar/foo' does not match ['bar', 'foo', 'baz'] (pattern shorter)"
-            ),
-            pytest.param("/bar/foo", ["bar"], False, False, id="A: '/bar/foo' does not match ['bar'] (pattern longer)"),
-            pytest.param("/bar/foo", ["baz", "foo"], False, False, id="A: '/bar/foo' does not match ['baz', 'foo'] (first part mismatch)"),
-            pytest.param("/bar/foo", ["bar", "baz"], False, False, id="A: '/bar/foo' does not match ['bar', 'baz'] (last part mismatch)"),
-            # Substring matches (is_substring_match=True)
-            pytest.param("/bar/foo", ["bar", "foobar"], True, True, id="A: '/bar/foo' matches ['bar', 'foobar'] as substring"),
-            pytest.param("/bar/foo", ["bar", "bazfoo"], True, True, id="A: '/bar/foo' matches ['bar', 'bazfoo'] as substring"),
-            pytest.param("/bar/fo", ["bar", "foo"], True, True, id="A: '/bar/fo' matches ['bar', 'foo'] as substring"),  # codespell:ignore
-            pytest.param("/bar/foo", ["bar", "baz"], True, False, id="A: '/bar/foo' does not match ['bar', 'baz'] (last no substr)"),
-            pytest.param(
-                "/bar/foo", ["baz", "foobar"], True, False, id="A: '/bar/foo' does not match ['baz', 'foobar'] (first part mismatch)"
-            ),
+            # Basic matching using matches_components
+            pytest.param("foo", ["MyClass", "foo"], True, id="'foo' matches ['MyClass', 'foo']"),
+            pytest.param("foo", ["MyClass", "bar"], False, id="'foo' does not match ['MyClass', 'bar']"),
+            pytest.param("^MyClass/foo$", ["MyClass", "foo"], True, id="'^MyClass/foo$' matches ['MyClass', 'foo'] exactly"),
+            pytest.param("^MyClass/foo$", ["com", "MyClass", "foo"], False, id="'^MyClass/foo$' does not match ['com', 'MyClass', 'foo']"),
         ],
     )
-    def test_match_name_path_pattern_path_len_2(self, name_path_pattern, symbol_name_path_parts, is_substring_match, expected):
-        """Tests matching for qualified names (e.g. 'module/class/func')."""
-        result = NamePathMatcher(name_path_pattern, is_substring_match).matches_components(symbol_name_path_parts, None)
-        error_msg = self._create_assertion_error_message(name_path_pattern, symbol_name_path_parts, is_substring_match, expected, result)
+    def test_matches_components(self, regex_pattern, symbol_name_path_parts, expected):
+        """Tests matches_components method (backward compatibility)."""
+        matcher = NamePathMatcher(regex_pattern)
+        result = matcher.matches_components(symbol_name_path_parts, None)
+        name_path = "/".join(symbol_name_path_parts)
+        error_msg = self._create_assertion_error_message(regex_pattern, name_path, expected, result)
         assert result == expected, error_msg
-
-    @pytest.mark.parametrize(
-        "name_path_pattern, symbol_name_path_parts, symbol_overload_idx, expected",
-        [
-            pytest.param("bar/foo", ["bar", "foo"], 0, True, id="R: 'bar/foo' matches ['bar', 'foo'] with overload_index=0"),
-            pytest.param("bar/foo", ["bar", "foo"], 1, True, id="R: 'bar/foo' matches ['bar', 'foo'] with overload_index=1"),
-            pytest.param("bar/foo[0]", ["bar", "foo"], 0, True, id="R: 'bar/foo[0]' matches ['bar', 'foo'] with overload_index=0"),
-            pytest.param("bar/foo[1]", ["bar", "foo"], 0, False, id="R: 'bar/foo[1]' does not match ['bar', 'foo'] with overload_index=0"),
-        ],
-    )
-    def test_match_name_path_pattern_with_overload_idx(self, name_path_pattern, symbol_name_path_parts, symbol_overload_idx, expected):
-        """Tests matching for qualified names (e.g. 'module/class/func')."""
-        matcher = NamePathMatcher(name_path_pattern, False)
-        result = matcher.matches_components(symbol_name_path_parts, symbol_overload_idx)
-        error_msg = self._create_assertion_error_message(name_path_pattern, symbol_name_path_parts, False, expected, result)
-        assert result == expected, error_msg
+    
+    def test_invalid_regex_pattern(self):
+        """Tests that invalid regex patterns raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid regular expression pattern"):
+            NamePathMatcher("[invalid")
+    
+    def test_case_sensitive_matching(self):
+        """Tests case-sensitive matching."""
+        matcher = NamePathMatcher("myclass", case_sensitive=True)
+        assert matcher.matches_name_path("MyClass/myMethod") is False
+        assert matcher.matches_name_path("myclass/myMethod") is True

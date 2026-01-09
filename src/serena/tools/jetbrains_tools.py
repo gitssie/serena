@@ -26,7 +26,7 @@ class JetBrainsFindSymbolTool(Tool, ToolMarkerSymbolicRead, ToolMarkerOptional):
 
         A name path is a path in the symbol tree *within a source file*.
         For example, the method `my_method` defined in class `MyClass` would have the name path `MyClass/my_method`.
-        If a symbol is overloaded (e.g., in Java), a 0-based index is appended (e.g. "MyClass/my_method[0]") to
+        If a symbol is overloaded (e.g., in Java), a 0-based index is appended (e.g. "MyClass/my_method#1") to
         uniquely identify it.
 
         To search for a symbol, you provide a name path pattern that is used to match against name paths.
@@ -34,7 +34,7 @@ class JetBrainsFindSymbolTool(Tool, ToolMarkerSymbolicRead, ToolMarkerOptional):
          * a simple name (e.g. "method"), which will match any symbol with that name
          * a relative path like "class/method", which will match any symbol with that name path suffix
          * an absolute name path "/class/method" (absolute name path), which requires an exact match of the full name path within the source file.
-        Append an index `[i]` to match a specific overload only, e.g. "MyClass/my_method[1]".
+        Append an index `#i` to match a specific overload, e.g. "MyClass/my_method#1".
 
         :param name_path_pattern: the name path matching pattern (see above)
         :param depth: depth up to which descendants shall be retrieved (e.g. use 1 to also retrieve immediate children;
