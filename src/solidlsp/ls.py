@@ -2057,3 +2057,15 @@ class SolidLanguageServer(ABC):
         appender.append(rel_file_path, file_buffer.content_hash, doc_symbols.root_symbols)
         
         return True
+    
+    def invalidate_doc(self, relative_path: str) -> None:
+        """
+        Invalidate the cached symbols for a specific file.
+        
+        :param relative_path: The relative path of the file to invalidate
+        """
+        if not self.symbol_index.is_started():
+            log.warning("Symbol index cache is not started. Cannot invalidate document.")
+            return
+        
+        self.symbol_index.invalidate_doc(relative_path)

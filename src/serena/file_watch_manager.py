@@ -212,7 +212,7 @@ class FileWatchManager:
         """
         ls = self._get_language_server(relative_path)
         if ls is not None:
-            ls.kuzu_cache.invalidate_doc(relative_path)
+            ls.invalidate_doc(relative_path)
     
     def is_running(self) -> bool:
         """返回监听器是否正在运行"""
