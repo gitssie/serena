@@ -9,7 +9,7 @@ applyTo: "**"
 **AXIOM** This document is NOT a reference manual—it is YOUR COGNITIVE OPERATING SYSTEM.
 
 state_machine FeedbackLoop {
-    states: [IDLE, PROCESSING, AWAITING_FEEDBACK, COMPLETED]
+states: [IDLE, PROCESSING, AWAITING_FEEDBACK, COMPLETED]
 
     initial_state: IDLE
 
@@ -48,15 +48,16 @@ priority: CRITICAL
         assistant.completing_response()
 
     then:
-        // 检查响应是否实质性（substantive）
+        // 实质性响应判定：任何改变系统状态、需要用户决策或执行复杂任务的操作
         is_substantive := (
-            response.used_any_tool() or              // 使用了工具
-            response.read_any_file() or              // 读取了文件
-            response.analyzed_code() or              // 分析了代码
-            response.provided_solution() or          // 提供了解决方案
-            response.explained_technical_concept() or // 解释了技术概念
-            response.line_count > 3 or               // 响应超过3行
-            response.awaiting_user_decision()        // 等待用户决策
+            response.has_tool_calls() or                      // 使用了任何工具
+            response.modified_files() or                       // 修改了文件
+            response.created_artifacts() or                    // 创建了产出物
+            response.performed_analysis() or                   // 执行了分析
+            response.provided_solution() or                    // 提供了解决方案
+            response.awaiting_user_decision() or               // 等待用户决策
+            response.complexity > SIMPLE or                    // 复杂度超过简单问答
+            response.line_count > 3                           // 响应长度超过3行
         )
 
         when is_substantive and not response.ends_with("mcp_feedback_interactive_feedback"):
@@ -76,10 +77,70 @@ priority: CRITICAL
             )
             append_to_response(feedback_call)
 
-            
             // 转换状态到 AWAITING_FEEDBACK，进入 FeedbackLoop
             transition_to(AWAITING_FEEDBACK)
             invoke_rule(FeedbackLoop)
+
+}
+
+rule CompletionCheckpoint {
+priority: CRITICAL
+
+    when:
+        assistant.about_to_complete_response()
+
+    then:
+        // 完成前强制检查点
+        completion_checklist := {
+            has_substantive_content: check_substantive_response(),
+            has_feedback_call: response.contains_tool_call("mcp_feedback_interactive_feedback"),
+            is_simple_query: response.is_trivial_question_answer(),
+            all_todos_completed: check_all_todos_status()
+        }
+
+        // 如果有实质性内容但没有反馈调用，强制阻止完成
+        when completion_checklist.has_substantive_content and not completion_checklist.has_feedback_call:
+            when not completion_checklist.is_simple_query:
+                violation := CriticalViolation(
+                    type: "FEEDBACK_OMISSION_AT_COMPLETION",
+                    severity: "CRITICAL",
+                    message: "完成响应前检测到遗漏反馈工具调用"
+                )
+                report_violation(violation)
+                halt_response()
+
+                // 自动补充反馈调用
+                force_append_feedback_call()
+                transition_to(AWAITING_FEEDBACK)
+
+}
+
+rule FeedbackLoopContinuity {
+priority: CRITICAL
+
+    when:
+        current_state = AWAITING_FEEDBACK
+
+    then:
+        // 确保反馈循环的连续性
+        when not response.last_tool_call = "mcp_feedback_interactive_feedback":
+            violation := CriticalViolation(
+                type: "FEEDBACK_LOOP_BROKEN",
+                severity: "CRITICAL",
+                message: "反馈循环中断，最后的工具调用必须是 interactive_feedback"
+            )
+            report_violation(violation)
+            halt_response()
+
+        // 反馈循环状态下禁止直接返回给用户
+        when attempting_user_response():
+            violation := CriticalViolation(
+                type: "PREMATURE_USER_RESPONSE",
+                severity: "CRITICAL",
+                message: "在 AWAITING_FEEDBACK 状态下不能直接响应用户"
+            )
+            report_violation(violation)
+            halt_response()
 
 }
 
@@ -100,7 +161,20 @@ priority: CRITICAL
             "architecture_analysis",    // 架构分析
             "requirement_analysis",     // 需求分析
             "code_review",              // 代码审查
-            "awaiting_confirmation"     // 等待确认
+            "awaiting_confirmation",    // 等待确认
+            "package_structure_analysis",  // 包结构分析
+            "database_design_advice",      // 数据库设计建议
+            "entity_mapping_discussion",   // 实体映射讨论
+            "refactoring_suggestion",      // 重构建议
+            "file_creation",               // 文件创建
+            "file_modification",           // 文件修改
+            "listener_implementation",     // 监听器实现
+            "service_method_addition",     // 服务方法添加
+            "mcp_tool_usage",              // MCP 工具使用
+            "feature_completion",          // 功能完成
+            "bug_fix",                     // Bug 修复
+            "database_migration",          // 数据库迁移
+            "configuration_setup"          // 配置设置
         ])
 
     then:
@@ -120,10 +194,40 @@ priority: CRITICAL
         )
 
         append_to_response(feedback_call)
-        
+
         // 转换状态到 AWAITING_FEEDBACK，进入 FeedbackLoop
         transition_to(AWAITING_FEEDBACK)
         invoke_rule(FeedbackLoop)
+
+}
+
+rule WorkCompletionFeedback {
+priority: CRITICAL
+
+    when:
+        assistant.declaring_work_complete() or
+        assistant.summarizing_completed_work() or
+        response.contains_completion_indicators([
+            "完成", "已完成", "实现完毕", "功能就绪",
+            "all done", "completed", "finished", "ready"
+        ])
+
+    then:
+        // 声明完成工作时必须调用反馈
+        when not response.contains_tool_call("mcp_feedback_interactive_feedback"):
+            violation := CriticalViolation(
+                type: "COMPLETION_WITHOUT_FEEDBACK",
+                severity: "CRITICAL",
+                message: "声明工作完成但未调用反馈工具"
+            )
+            report_violation(violation)
+            halt_response()
+
+            // 强制添加反馈调用
+            force_append_feedback_call({
+                project_directory: current_workspace_path(),
+                summary: extract_completion_summary()
+            })
 
 }
 

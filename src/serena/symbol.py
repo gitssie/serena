@@ -311,9 +311,11 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
         
         Uses # symbol for overload index instead of [] to avoid regex special characters.
         """
-        name_path = NAME_PATH_SEP.join(self.get_name_path_parts())
-        if "overload_idx" in self.symbol_root and self.symbol_root['overload_idx'] > 0:
-            name_path += f"#{self.symbol_root['overload_idx']}"
+        name_path = self.symbol_root.get('name_path',None)
+        if name_path is None:
+            name_path = NAME_PATH_SEP.join(self.get_name_path_parts())
+            if "overload_idx" in self.symbol_root and self.symbol_root['overload_idx'] > 0:
+                name_path += f"#{self.symbol_root['overload_idx']}"
         return name_path
 
     def get_name_path_parts(self) -> list[str]:
@@ -376,6 +378,7 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
         def traverse(s: "LanguageServerSymbol") -> None:
             if should_include(s):
                 result.append(s)
+                return
             for c in s.iter_children():
                 traverse(c)
 
@@ -417,7 +420,7 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
         if location:
             result["location"] = self.location.to_dict(include_relative_path=include_relative_path)
             body_start_line, body_end_line = self.get_body_line_numbers()
-            result["body_location"] = {"start_line": body_start_line, "end_line": body_end_line}
+            result["body_location"] = [body_start_line, body_end_line]
 
         if include_body:
             if self.body is None:

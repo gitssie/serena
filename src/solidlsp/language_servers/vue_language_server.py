@@ -382,6 +382,31 @@ class VueLanguageServer(SolidLanguageServer):
         with self._ts_server.open_file(relative_file_path):
             return self._ts_server.request_rename_symbol_edit(relative_file_path, line, column, new_name)
 
+    @override
+    def request_text_document_diagnostics(self, relative_file_path: str, timeout: float = 15.0) -> list[ls_types.Diagnostic]:
+        """
+        Request diagnostics from both Vue LS and TypeScript LS, then merge results.
+        
+        :param relative_file_path: The relative path of the file to retrieve diagnostics for
+        :param timeout: Timeout for the diagnostic request
+        :return: A list of merged diagnostics from both language servers
+        """
+        if not self.server_started or not self._ts_server.server_started:
+            log.error("request_text_document_diagnostics called before Language Server started")
+            raise SolidLSPException("Language Server not started")
+
+        all_diagnostics: list[ls_types.Diagnostic] = []
+        
+         # Get diagnostics from Vue LS
+        vue_diagnostics = super().request_text_document_diagnostics(relative_file_path, timeout)
+        all_diagnostics.extend(vue_diagnostics)
+        
+        # Get diagnostics from TypeScript LS
+        ts_diagnostics = self._ts_server.request_text_document_diagnostics(relative_file_path, timeout)
+        all_diagnostics.extend(ts_diagnostics)
+
+        return all_diagnostics
+
     @classmethod
     def _setup_runtime_dependencies(
         cls, config: LanguageServerConfig, solidlsp_settings: SolidLSPSettings
@@ -497,6 +522,12 @@ class VueLanguageServer(SolidLanguageServer):
                     "signatureHelp": {"dynamicRegistration": True},
                     "codeAction": {"dynamicRegistration": True},
                     "rename": {"dynamicRegistration": True, "prepareSupport": True},
+                    "publishDiagnostics": {
+                        "dynamicRegistration": True,
+                        "relatedInformation": True,
+                        "tagSupport": {"valueSet": [1, 2]},
+                        "versionSupport": False,
+                    },
                 },
                 "workspace": {
                     "workspaceFolders": True,
@@ -750,8 +781,14 @@ class VueLanguageServer(SolidLanguageServer):
         if not isinstance(symbols[0], dict) or "range" not in symbols[0]:
             return symbols
 
-        return self._filter_shorthand_property_duplicates(symbols)
-
+        children = self._filter_shorthand_property_duplicates(symbols)
+        # Prefix each child's name with the file basename
+        file_basename = os.path.splitext(os.path.basename(relative_file_path))[0]
+        for child in children:
+            child['name'] = file_basename + '/' + child['name']
+        
+        return children
+    
     def _filter_shorthand_property_duplicates(
         self, symbols: list[DocumentSymbol] | list[SymbolInformation]
     ) -> list[DocumentSymbol] | list[SymbolInformation]:

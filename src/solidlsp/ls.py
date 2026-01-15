@@ -1140,7 +1140,7 @@ class SolidLanguageServer(ABC):
             document_symbols = DocumentSymbols(unified_root_symbols)
             return document_symbols
     
-    
+
     def request_document_symbols(self, relative_file_path: str, file_buffer: LSPFileBuffer | None = None) -> DocumentSymbols:
         """
         Retrieves the collection of symbols in the given file

@@ -164,10 +164,10 @@ class DuckdbIndex(SymbolIndex):
                 ON {self.schema_name}.symbols(doc_id)
             """)
             
-            self.conn.execute(f"""
-                CREATE INDEX IF NOT EXISTS idx_{self.schema_name}_symbols_name 
-                ON {self.schema_name}.symbols(name)
-            """)
+            # self.conn.execute(f"""
+            #     CREATE INDEX IF NOT EXISTS idx_{self.schema_name}_symbols_name 
+            #     ON {self.schema_name}.symbols(name)
+            # """)
             
             self.conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_{self.schema_name}_symbols_parent 
@@ -742,7 +742,7 @@ class DuckdbIndex(SymbolIndex):
                 start.get('character', 0),
                 end.get('line', 0),
                 end.get('character', 0),
-                symbol.get('body', ''),
+                symbol.get('body', None),
                 overload_idx
             )
             collected_rows.append(row)
@@ -811,8 +811,6 @@ class DuckdbIndex(SymbolIndex):
         :param relative_path_regex: Optional regex to match file relative_path
         :return: (sql_query, params) tuple
         """
-        from serena.symbol import NamePathMatcher
-        
         conditions = []
         params = []
         
@@ -923,7 +921,7 @@ class BatchAppender(SymbolAppender):
         self.docs_rows = []  # type: List[tuple]
         self.symbols_rows = []  # type: List[tuple]
         self.doc_ids_to_delete = []  # type: List[str]
-        self.batch_size = 2000  # 以行数为单位的批量大小
+        self.batch_size = 3000  # 以行数为单位的批量大小
     
     def append(
         self,

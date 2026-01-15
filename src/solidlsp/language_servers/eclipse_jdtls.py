@@ -23,6 +23,8 @@ from solidlsp.ls_utils import FileUtils, PlatformUtils
 from solidlsp.lsp_protocol_handler.lsp_types import DocumentSymbol, InitializeParams, SymbolInformation
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 from solidlsp.settings import SolidLSPSettings
+from solidlsp.language_servers.publish_diagnostics_handler import JavaPublishDiagnosticsHandler
+from solidlsp.ls_exceptions import SolidLSPException
 
 log = logging.getLogger(__name__)
 
@@ -150,14 +152,13 @@ class EclipseJDTLS(SolidLanguageServer):
         self.service_ready_event = threading.Event()
         self.intellicode_enable_command_available = threading.Event()
         self.initialize_searcher_command_available = threading.Event()
-        
-        # For handling async publishDiagnostics notifications
-        self._diagnostics_waiters: dict[str, dict] = {}
-        self._diagnostics_lock = threading.Lock()
 
         super().__init__(
             config, repository_root_path, ProcessLaunchInfo(cmd, proc_env, proc_cwd), "java", solidlsp_settings=solidlsp_settings
         )
+        
+        # Initialize JavaPublishDiagnosticsHandler after super().__init__
+        self._publish_diagnostics_handler = JavaPublishDiagnosticsHandler(self)
 
     @override
     def is_ignored_dirname(self, dirname: str) -> bool:
@@ -195,8 +196,6 @@ class EclipseJDTLS(SolidLanguageServer):
         :param timeout: Maximum time to wait for diagnostics (default: 15.0 seconds)
         :return: A list of diagnostics for the file
         """
-        from solidlsp.ls_exceptions import SolidLSPException
-        
         if not self.server_started:
             log.error("request_text_document_diagnostics called before Language Server started")
             raise SolidLSPException("Language Server not started")
@@ -204,67 +203,7 @@ class EclipseJDTLS(SolidLanguageServer):
         self._validate_file_path(relative_file_path)
         
         with self.open_file(relative_file_path):
-            uri = pathlib.Path(str(PurePath(self.repository_root_path, relative_file_path))).as_uri()
-            
-            # Create waiter for this file
-            waiter = {
-                'event': threading.Event(),
-                'diagnostics': None
-            }
-            
-            with self._diagnostics_lock:
-                self._diagnostics_waiters[uri] = waiter
-            
-            try:
-                # Wait for publishDiagnostics notification
-                if waiter['event'].wait(timeout):
-                    diagnostics = waiter['diagnostics']
-                    if diagnostics is None:
-                        # No diagnostics means the file has no errors
-                        return [{
-                            "uri": uri,
-                            "severity": 3,  # Information
-                            "message": "Diagnostics check completed successfully - no issues found"
-                        }]
-                    
-                    # Convert to ls_types.Diagnostic format
-                    from solidlsp import ls_types
-                    ret: list[ls_types.Diagnostic] = []
-                    for item in diagnostics:
-                        message = item.get("message", "")
-                        # Filter out Type safety warnings (unchecked conversion warnings for Java generics)
-                        if message.startswith("Type safety:"):
-                            continue
-                        new_item: ls_types.Diagnostic = {
-                            "uri": uri,
-                            "severity": item.get("severity", 1),
-                            "message": message,
-                            "range": item["range"],
-                            "code": item.get("code"),
-                        }
-                        ret.append(new_item)
-                    
-                    # If all diagnostics were filtered out, return success message
-                    if not ret:
-                        return [{
-                            "uri": uri,
-                            "severity": 3,  # Information
-                            "message": "Diagnostics check completed successfully - no issues found"
-                        }]
-                    
-                    return ret
-                else:
-                    log.warning(f"Timeout ({timeout}s) waiting for diagnostics for {relative_file_path}")
-                    # Return diagnostic message indicating timeout
-                    return [{
-                        "uri": uri,
-                        "severity": 2,  # Warning
-                        "message": f"Timeout ({timeout}s) waiting for diagnostics"
-                    }]
-            finally:
-                # Clean up waiter immediately after use
-                with self._diagnostics_lock:
-                    self._diagnostics_waiters.pop(uri, None)
+            return self._publish_diagnostics_handler.wait_for_diagnostics(relative_file_path, timeout)
 
     @classmethod
     def _setupRuntimeDependencies(cls, config: LanguageServerConfig, solidlsp_settings: SolidLSPSettings) -> RuntimeDependencyPaths:
@@ -877,20 +816,9 @@ class EclipseJDTLS(SolidLanguageServer):
 
         def do_nothing(params: dict) -> None:
             return
-
+        
         def on_publish_diagnostics(params: dict) -> None:
-            """Handle textDocument/publishDiagnostics notification from JDTLS."""
-            uri = params.get('uri')
-            diagnostics = params.get('diagnostics', [])
-            if len(diagnostics) > 0:
-                log.debug(f"Received textDocument/publishDiagnostics: uri={uri}, diagnostics_count={len(diagnostics)}")
-            
-            # Notify any waiting request_text_document_diagnostics calls
-            with self._diagnostics_lock:
-                if uri in self._diagnostics_waiters:
-                    waiter = self._diagnostics_waiters[uri]
-                    waiter['diagnostics'] = diagnostics
-                    waiter['event'].set()
+            self._publish_diagnostics_handler.on_publish_diagnostics(params)
 
         self.server.on_request("client/registerCapability", register_capability_handler)
         self.server.on_notification("language/status", lang_status_handler)

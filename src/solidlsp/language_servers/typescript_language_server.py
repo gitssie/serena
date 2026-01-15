@@ -19,6 +19,7 @@ from solidlsp.ls_utils import PlatformId, PlatformUtils
 from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 from solidlsp.settings import SolidLSPSettings
+from solidlsp.language_servers.publish_diagnostics_handler import PublishDiagnosticsHandler
 
 from .common import RuntimeDependency, RuntimeDependencyCollection
 
@@ -82,6 +83,14 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         )
         self.server_ready = threading.Event()
         self.initialize_searcher_command_available = threading.Event()
+        
+        # Initialize PublishDiagnosticsHandler after super().__init__
+        # TypeScript LSP 需要稳定性等待，因为它会发送多次诊断通知（先空后有）
+        self._publish_diagnostics_handler = PublishDiagnosticsHandler(
+            self, 
+            wait_for_stable=True,     # 启用稳定性等待
+            stability_delay=3       # 等待3秒确认诊断稳定
+        )
 
     @override
     def is_ignored_dirname(self, dirname: str) -> bool:
@@ -91,6 +100,30 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             "build",
             "coverage",
         ]
+    
+    @override
+    def request_text_document_diagnostics(self, relative_file_path: str, timeout: float = 15.0) -> list[ls_types.Diagnostic]:
+        """
+        Override base implementation to handle TypeScript's push-based diagnostics.
+        
+        TypeScript language server pushes diagnostics via textDocument/publishDiagnostics
+        notifications. This method waits for such notifications.
+        
+        :param relative_file_path: The relative path of the file to retrieve diagnostics for
+        :param timeout: Maximum time to wait for diagnostics (default: 15.0 seconds)
+        :return: A list of diagnostics for the file
+        """
+        from solidlsp.ls_exceptions import SolidLSPException
+        
+        if not self.server_started:
+            log.error("request_text_document_diagnostics called before Language Server started")
+            raise SolidLSPException("Language Server not started")
+        
+        self._validate_file_path(relative_file_path)
+        
+        with self.open_file(relative_file_path):
+            return self._publish_diagnostics_handler.wait_for_diagnostics(relative_file_path, timeout)
+
 
     @staticmethod
     def _determine_log_level(line: str) -> int:
@@ -203,7 +236,32 @@ class TypeScriptLanguageServer(SolidLanguageServer):
                     },
                     "hover": {"dynamicRegistration": True, "contentFormat": ["markdown", "plaintext"]},
                     "signatureHelp": {"dynamicRegistration": True},
-                    "codeAction": {"dynamicRegistration": True},
+                    "codeAction": {
+                        "dynamicRegistration": True,
+                        "codeActionLiteralSupport": {
+                            "codeActionKind": {
+                                "valueSet": [
+                                    "",  # Empty string means all kinds
+                                    "quickfix",
+                                    "refactor",
+                                    "refactor.extract",
+                                    "refactor.inline",
+                                    "refactor.rewrite",
+                                    "source",
+                                    "source.organizeImports",
+                                    "source.fixAll",
+                                ]
+                            }
+                        },
+                        "isPreferredSupport": True,
+                        "disabledSupport": True,
+                        "dataSupport": True,
+                        "resolveSupport": {
+                            "properties": ["edit"]
+                        },
+                        "honorsChangeAnnotations": False
+                    },
+                    'publishDiagnostics': {"dynamicRegistration": True , "tagSupport": True},
                     "rename": {"dynamicRegistration": True, "prepareSupport": True},
                 },
                 "workspace": {
@@ -264,12 +322,15 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             if params.get("quiescent") == True:
                 self.server_ready.set()
                 self.completions_available.set()
+        
+        def on_publish_diagnostics(params: dict) -> None:
+            self._publish_diagnostics_handler.on_publish_diagnostics(params)
 
         self.server.on_request("client/registerCapability", register_capability_handler)
         self.server.on_notification("window/logMessage", window_log_message)
         self.server.on_request("workspace/executeClientCommand", execute_client_command_handler)
         self.server.on_notification("$/progress", do_nothing)
-        self.server.on_notification("textDocument/publishDiagnostics", do_nothing)
+        self.server.on_notification("textDocument/publishDiagnostics", on_publish_diagnostics)
         self.server.on_notification("experimental/serverStatus", check_experimental_status)
 
         log.info("Starting TypeScript server process")
