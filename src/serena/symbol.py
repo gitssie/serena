@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass
@@ -378,7 +379,7 @@ class LanguageServerSymbol(Symbol, ToStringMixin):
         def traverse(s: "LanguageServerSymbol") -> None:
             if should_include(s):
                 result.append(s)
-                return
+            
             for c in s.iter_children():
                 traverse(c)
 
@@ -508,6 +509,38 @@ class LanguageServerSymbolRetriever:
     def get_language_server(self, relative_path: str) -> SolidLanguageServer:
         return self._ls_manager.get_language_server(relative_path)
 
+    @staticmethod
+    def optimize_name_path_pattern(pattern: str) -> str:
+        """
+        Optimize pattern to match only symbol names (last segment of name_path) for simple searches.
+        
+        Rules:
+        1. If pattern contains '/', assume path search - no change
+        2. If pattern contains regex operators, assume regex - no change  
+        3. Otherwise, convert to match last segment only
+        
+        Examples:
+            "Service" -> "(^|/)Service($|/)"
+            "get.*" -> unchanged (regex)
+            "MyClass/getUser" -> unchanged (path search)
+        """
+        
+        # If contains '/', user wants path search
+        if "/" in pattern:
+            return pattern
+        
+        # If contains regex operators, user already using regex
+        regex_markers = [
+            r'\^', r'\$', r'\.\*', r'\.\+', r'\[', r'\]',
+            r'\(', r'\)', r'\|', r'\{', r'\}', r'\?', r'\\[dDwWsS]'
+        ]
+        
+        if any(re.search(marker, pattern) for marker in regex_markers):
+            return pattern
+        
+        # Simple string search - match last segment only
+        return f"(^|/){re.escape(pattern)}($|/)"
+
     def find(
         self,
         pattern: str,
@@ -524,6 +557,7 @@ class LanguageServerSymbolRetriever:
         :param exclude_kinds: Optional list of symbol kinds to exclude
         :return: List of matching symbols
         """
+        pattern = self.optimize_name_path_pattern(pattern)
         
         symbols: list[LanguageServerSymbol] = []
         for lang_server in self._ls_manager.iter_language_servers():

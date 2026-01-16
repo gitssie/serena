@@ -253,14 +253,15 @@ class VueLanguageServer(SolidLanguageServer):
                     continue
 
                 rel_path = Path(abs_path).relative_to(self.repository_root_path)
-                if self.is_ignored_path(str(rel_path)):
+                if self.is_ignored_path(str(rel_path)) or rel_path.as_posix() == Path(relative_file_path).as_posix():
                     log.debug(f"Ignoring reference in {rel_path}")
                     continue
 
                 new_item: dict = {}
                 new_item.update(item)  # type: ignore[arg-type]
                 new_item["absolutePath"] = str(abs_path)
-                new_item["relativePath"] = str(rel_path)
+                new_item["relativePath"] = rel_path.as_posix()
+                new_item["uri"] = Path(abs_path).as_uri()
                 result.append(ls_types.Location(**new_item))  # type: ignore
 
         return result
@@ -319,7 +320,8 @@ class VueLanguageServer(SolidLanguageServer):
                 new_item: dict = {}
                 new_item.update(item)  # type: ignore[arg-type]
                 new_item["absolutePath"] = str(abs_path)
-                new_item["relativePath"] = str(rel_path)
+                new_item["relativePath"] = rel_path.as_posix()
+                new_item["uri"] = Path(abs_path).as_uri()
                 ret.append(Location(**new_item))  # type: ignore
 
             log.debug(f"Found {len(ret)} file references for {relative_file_path}")
@@ -782,11 +784,18 @@ class VueLanguageServer(SolidLanguageServer):
             return symbols
 
         children = self._filter_shorthand_property_duplicates(symbols)
-        # Prefix each child's name with the file basename
-        file_basename = os.path.splitext(os.path.basename(relative_file_path))[0]
-        for child in children:
-            child['name'] = file_basename + '/' + child['name']
         
+        # Create vue symbol for root symbols
+        file_lines = file_data.split_lines()
+        vue_symbol = ls_types.UnifiedSymbolInformation(  # type: ignore
+            name=os.path.splitext(os.path.basename(relative_file_path))[0],
+            kind=ls_types.SymbolKind.Module,
+            body=file_data.contents,
+            location=ls_types.Location(
+                range={"start": {"line": 0, "character": 0}, "end": {"line": len(file_lines), "character": 0}}
+            )
+        )
+        children.append(vue_symbol)
         return children
     
     def _filter_shorthand_property_duplicates(
