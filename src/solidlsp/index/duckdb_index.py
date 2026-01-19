@@ -78,7 +78,7 @@ class DuckdbIndex(SymbolIndex):
             # Initialize schema
             self._init_schema()
             
-            log.info(f"Started DuckDB index with schema '{self.schema_name}' at {self.db_path}")
+            log.debug(f"Started DuckDB index with schema '{self.schema_name}' at {self.db_path}")
     
     def stop(self) -> None:
         """Stop the index connection and release resources."""
@@ -88,7 +88,7 @@ class DuckdbIndex(SymbolIndex):
             
             self.conn.close()
             self.conn = None
-            log.info(f"Stopped DuckDB index with schema '{self.schema_name}'")
+            log.debug(f"Stopped DuckDB index with schema '{self.schema_name}'")
     
     def _optimize_connection(self) -> None:
         """Optimize DuckDB connection settings for better batch insert performance."""
@@ -114,15 +114,15 @@ class DuckdbIndex(SymbolIndex):
     def _init_schema(self) -> None:
         """Initialize the schema and table structures."""
         with self._lock:
-            log.info(f"Starting schema initialization for '{self.schema_name}'")
+            log.debug(f"Starting schema initialization for '{self.schema_name}'")
             
             # Create schema
-            log.info(f"Creating schema '{self.schema_name}'...")
+            log.debug(f"Creating schema '{self.schema_name}'...")
             self.conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema_name}")
-            log.info(f"Schema '{self.schema_name}' created successfully")
+            log.debug(f"Schema '{self.schema_name}' created successfully")
             
             # Create docs table
-            log.info(f"Creating docs table in schema '{self.schema_name}'...")
+            log.debug(f"Creating docs table in schema '{self.schema_name}'...")
             self.conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {self.schema_name}.docs (
                     id VARCHAR PRIMARY KEY,
@@ -133,10 +133,10 @@ class DuckdbIndex(SymbolIndex):
                     schema_version INTEGER
                 )
             """)
-            log.info(f"Docs table created successfully in schema '{self.schema_name}'")
+            log.debug(f"Docs table created successfully in schema '{self.schema_name}'")
             
             # Create symbols table
-            log.info(f"Creating symbols table in schema '{self.schema_name}'...")
+            log.debug(f"Creating symbols table in schema '{self.schema_name}'...")
             self.conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {self.schema_name}.symbols (
                     id VARCHAR PRIMARY KEY,
@@ -155,10 +155,10 @@ class DuckdbIndex(SymbolIndex):
                     FOREIGN KEY (doc_id) REFERENCES {self.schema_name}.docs(id)
                 )
             """)
-            log.info(f"Symbols table created successfully in schema '{self.schema_name}'")
+            log.debug(f"Symbols table created successfully in schema '{self.schema_name}'")
             
             # Create indexes for performance
-            log.info(f"Creating indexes for schema '{self.schema_name}'...")
+            log.debug(f"Creating indexes for schema '{self.schema_name}'...")
             self.conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_{self.schema_name}_symbols_doc 
                 ON {self.schema_name}.symbols(doc_id)
@@ -178,7 +178,7 @@ class DuckdbIndex(SymbolIndex):
                 CREATE INDEX IF NOT EXISTS idx_{self.schema_name}_symbols_name_path 
                 ON {self.schema_name}.symbols(name_path)
             """)
-            log.info(f"Indexes created successfully for schema '{self.schema_name}'")
+            log.debug(f"Indexes created successfully for schema '{self.schema_name}'")
             
             log.debug(f"Initialized schema '{self.schema_name}' successfully")
     
