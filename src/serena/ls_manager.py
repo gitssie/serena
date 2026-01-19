@@ -139,6 +139,17 @@ class LanguageServerManager:
             ls = self._default_language_server
         return self._ensure_functional_ls(ls)
 
+    def get_language_server_option(self, relative_path: str) -> SolidLanguageServer | None:
+        ls: SolidLanguageServer | None = None
+        if len(self._language_servers) > 1:
+            for candidate in self._language_servers.values():
+                if not candidate.is_ignored_path(relative_path, ignore_unsupported_files=True):
+                    ls = candidate
+                    break
+        if ls is not None:
+            self._ensure_functional_ls(ls)
+        return ls
+
     def _create_and_start_language_server(self, language: Language) -> SolidLanguageServer:
         if self._language_server_factory is None:
             raise ValueError(f"No language server factory available to create language server for {language}")

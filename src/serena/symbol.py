@@ -509,6 +509,9 @@ class LanguageServerSymbolRetriever:
     def get_language_server(self, relative_path: str) -> SolidLanguageServer:
         return self._ls_manager.get_language_server(relative_path)
 
+    def get_language_server_option(self, relative_path: str) -> SolidLanguageServer | None:
+        return self._ls_manager.get_language_server_option(relative_path)
+
     @staticmethod
     def optimize_name_path_pattern(pattern: str) -> str:
         """
@@ -729,7 +732,9 @@ class LanguageServerSymbolRetriever:
         :param timeout: timeout in seconds for the request
         :return: a list of diagnostics for the file
         """
-        lang_server = self.get_language_server(relative_path)
+        lang_server = self.get_language_server_option(relative_path)
+        if lang_server is None:
+            return []
         return lang_server.request_text_document_diagnostics(relative_path, timeout=timeout)
 
 
