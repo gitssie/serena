@@ -130,7 +130,7 @@ class LanguageServerManager:
 
     def get_language_server(self, relative_path: str) -> SolidLanguageServer:
         ls: SolidLanguageServer | None = None
-        if len(self._language_servers) > 1:
+        if len(self._language_servers) > 0:
             for candidate in self._language_servers.values():
                 if not candidate.is_ignored_path(relative_path, ignore_unsupported_files=True):
                     ls = candidate
@@ -141,13 +141,13 @@ class LanguageServerManager:
 
     def get_language_server_option(self, relative_path: str) -> SolidLanguageServer | None:
         ls: SolidLanguageServer | None = None
-        if len(self._language_servers) > 1:
+        if len(self._language_servers) > 0:
             for candidate in self._language_servers.values():
                 if not candidate.is_ignored_path(relative_path, ignore_unsupported_files=True):
                     ls = candidate
                     break
         if ls is not None:
-            self._ensure_functional_ls(ls)
+            ls = self._ensure_functional_ls(ls)
         return ls
 
     def _create_and_start_language_server(self, language: Language) -> SolidLanguageServer:
