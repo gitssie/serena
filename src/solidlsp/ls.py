@@ -863,8 +863,8 @@ class SolidLanguageServer(ABC):
 
         :return MatchedConsecutiveLines: A container with the desired lines.
         """
-        with self.open_file(relative_file_path) as file_data:
-            file_contents = file_data.contents
+        file_data = self.read_file(relative_file_path)
+        file_contents = file_data.contents
         return MatchedConsecutiveLines.from_file_contents(
             file_contents,
             line=line,

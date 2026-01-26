@@ -6,6 +6,7 @@ import os
 from collections import defaultdict
 from collections.abc import Sequence
 from copy import copy
+from itertools import count
 from typing import Any
 
 from serena.tools import (
@@ -15,7 +16,11 @@ from serena.tools import (
     ToolMarkerSymbolicRead,
 )
 from serena.tools.tools_base import ToolMarkerOptional
-from solidlsp.ls_types import SymbolKind
+from solidlsp.ls_types import DiagnosticSeverity, SymbolKind
+
+
+# Counter for file reference numbering
+_file_ref_counter = count(1)
 
 
 def _sanitize_symbol_dict(symbol_dict: dict[str, Any]) -> dict[str, Any]:
@@ -32,6 +37,34 @@ def _sanitize_symbol_dict(symbol_dict: dict[str, Any]) -> dict[str, Any]:
     # also remove name, name_path should be enough
     symbol_dict.pop("name")
     return symbol_dict
+
+
+def _compress_symbols(symbol_dicts: list[dict[str, Any]]) -> list[dict[str, Any] | str]:
+    """
+    Compress symbols by creating a file path mapping to reduce token consumption.
+    
+    Modifies symbol_dicts in-place by replacing 'relative_path' with short 'file_ref'.
+    Returns a flat list with file mapping string as first element.
+    
+    :param symbol_dicts: List of sanitized symbol dictionaries (modified in-place)
+    :return: Flat list: [file_mapping_string, symbol1, symbol2, ...]
+    """
+    if not symbol_dicts:
+        return []
+    
+    # Build mapping and modify symbols in single pass
+    path_to_key = {}
+    for symbol_dict in symbol_dicts:
+        relative_path = symbol_dict.get("relative_path")
+        if relative_path:
+            if relative_path not in path_to_key:
+                path_to_key[relative_path] = f"e{next(_file_ref_counter)}"
+            symbol_dict["relative_path"] = path_to_key[relative_path]
+    
+    # Create compact file mapping string
+    files_mapping = "Files: " + ", ".join(f"{key}= {path}" for path, key in sorted(path_to_key.items()))
+    
+    return [files_mapping] + symbol_dicts
 
 
 class RestartLanguageServerTool(Tool, ToolMarkerOptional):
@@ -181,7 +214,9 @@ class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
         )
         # depth=0 to only return the matched symbols, no children
         symbol_dicts = [_sanitize_symbol_dict(s.to_dict(kind=True, location=True, depth=0, include_body=include_body)) for s in symbols]
-        result = self._to_json(symbol_dicts)
+        # Compress symbols with path mapping to reduce token consumption
+        compressed_result = _compress_symbols(symbol_dicts)
+        result = self._to_json(compressed_result)
         return self._limit_length(result, max_answer_chars)
 
 
@@ -234,7 +269,9 @@ class FindReferencingSymbolsTool(Tool, ToolMarkerSymbolicRead):
                 )
                 ref_dict["content_around_reference"] = content_around_ref.to_display_string()
             reference_dicts.append(ref_dict)
-        result = self._to_json(reference_dicts)
+        # Compress references with path mapping to reduce token consumption
+        compressed_result = _compress_symbols(reference_dicts)
+        result = self._to_json(compressed_result)
         return self._limit_length(result, max_answer_chars)
 
 
@@ -375,9 +412,16 @@ class DiagnosticsTool(Tool, ToolMarkerSymbolicRead):
         diagnostics_list = []
         for diag in diagnostics:
             item = {
-                "severity": diag["severity"],
                 "message": diag["message"]
             }
+            # severity is optional - convert to readable string if present
+            if "severity" in diag:
+                severity_value = diag["severity"]
+                try:
+                    severity_enum = DiagnosticSeverity(severity_value)
+                    item["severity"] = severity_enum.name
+                except (ValueError, KeyError):
+                    item["severity"] = severity_value
             # range is optional - only include if present
             if "range" in diag:
                 item["range"] = diag["range"]
