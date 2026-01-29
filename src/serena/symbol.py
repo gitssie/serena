@@ -533,16 +533,14 @@ class LanguageServerSymbolRetriever:
             return pattern
         
         # If contains regex operators, user already using regex
-        regex_markers = [
-            r'\^', r'\$', r'\.\*', r'\.\+', r'\[', r'\]',
-            r'\(', r'\)', r'\|', r'\{', r'\}', r'\?', r'\\[dDwWsS]'
-        ]
+        regex_markers = ['^', '$', '.*', '.+', '[', ']', '(', ')', '|', '{', '}', '?', r'\d', r'\D', r'\w', r'\W', r'\s', r'\S']
         
-        if any(re.search(marker, pattern) for marker in regex_markers):
+        if any(marker in pattern for marker in regex_markers):
             return pattern
         
-        # Simple string search - match last segment only
-        return f"(^|/){re.escape(pattern)}($|/)"
+        escaped = re.escape(pattern)
+        # Match symbol name at any position, including overloaded variants (queryMap, queryMap#1, queryMap#2)
+        return f"(^|/){escaped}(#\\d+)?($|/)"
 
     def find(
         self,
